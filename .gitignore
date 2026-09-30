@@ -1,0 +1,23 @@
+# data (large, rebuilt from TDX / scripts)
+database/raw/
+database/processed/
+*.parquet
+*.day
+
+# python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# secrets
+.env
+*token*
+
+# os / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# script outputs
+results/
