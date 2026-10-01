@@ -1,9 +1,11 @@
 import unittest
+import tempfile
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from strategies.kline_similarity import KlineSimilarityEngine, SimilarityConfig, aggregate_bars
+from strategies.kline_similarity import KlineSimilarityEngine, SimilarityConfig, aggregate_bars, build_visual_results
 
 
 def _bars(phase=0.0, n=180):
@@ -52,6 +54,21 @@ class EngineTests(unittest.TestCase):
         )
         result = engine.search("A", "2020-04-01", "2020-04-30", history_only=True)
         self.assertTrue(all(x.end_date < pd.Timestamp("2020-04-01") for x in result))
+
+    def test_visual_results_write_top10_style_svg_and_html(self):
+        engine = KlineSimilarityEngine(
+            Provider(), SimilarityConfig(local_top_n=3, recall_n=20, top_k=3)
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            result = build_visual_results(engine, "A", "2020-04-01", "2020-04-30",
+                                          timeframe="1d", output_dir=tmp, top_k=3,
+                                          history_only=False)
+            self.assertEqual(len(result), 3)
+            self.assertTrue(all(Path(x["image_path"]).exists() for x in result))
+            self.assertTrue(all("interval" in x and x["timeframe"] == "1d" for x in result))
+            html = Path(result[0]["html_path"]).read_text(encoding="utf-8")
+            self.assertIn("前后各44根", html)
+            self.assertIn("<svg", html)
 
 
 if __name__ == "__main__":

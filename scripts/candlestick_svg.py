@@ -39,7 +39,7 @@ def centered_window(bars,target_date,period="D",before=22,after=22):
     if not len(found): return bars.iloc[0:0].copy()
     pos=int(found[0]); return bars.iloc[max(0,pos-before):min(len(bars),pos+after+1)].reset_index(drop=True)
 
-def render_chart(bars,title,subtitle="",target_date=None,signal_date=None,period="D",width=720,height=360,show_volume=True,range_start=None,range_end=None):
+def render_chart(bars,title,subtitle="",target_date=None,signal_date=None,period="D",width=720,height=360,show_volume=True,range_start=None,range_end=None,target_start=None,target_end=None):
     """绘制单个周期 SVG；range_start/end 用于映射低周期完整视窗。"""
     bars=bars.reset_index(drop=True).copy()
     if bars.empty: return f'<svg viewBox="0 0 {width} 100" class="panel"><text x="12" y="50" class="title">{esc(title)}：无可用行情</text></svg>'
@@ -58,6 +58,19 @@ def render_chart(bars,title,subtitle="",target_date=None,signal_date=None,period
         if date is None:return None
         hit=np.flatnonzero(bars.period_key.values==target_period_key(date,period)); return int(hit[0]) if len(hit) else None
     target_idx,signal_idx=locate(target_date),locate(signal_date)
+    # A query/candidate can span multiple bars.  Keep target_date for backward
+    # compatibility, while target_start/target_end shades the complete interval.
+    if target_start is None: target_start=target_date
+    if target_end is None: target_end=target_date
+    target_positions=[]
+    if target_start is not None and target_end is not None:
+        ts,te=pd.Timestamp(target_start),pd.Timestamp(target_end)
+        for i,bar_date in enumerate(bars.date):
+            bd=pd.Timestamp(bar_date)
+            if period=="D": bs,be=bd,bd
+            elif period=="W": bs,be=bd-pd.Timedelta(days=6),bd
+            else: bs,be=bd.to_period("M").start_time,bd.to_period("M").end_time.normalize()
+            if bs<=te and be>=ts: target_positions.append(i)
     # Higher-timeframe panels shade the complete lower-timeframe viewport.
     # A weekly bar is represented by its Monday-Friday interval; a monthly bar
     # by its calendar-month interval. This makes the panels read like zoom levels.
@@ -70,6 +83,9 @@ def render_chart(bars,title,subtitle="",target_date=None,signal_date=None,period
             else: bs,be=bd.to_period("M").start_time,bd.to_period("M").end_time.normalize()
             if bs<=re and be>=rs:
                 out.append(f'<rect x="{left+i*xstep:.1f}" y="{top}" width="{xstep:.1f}" height="{chart_h+vol_h+8}" class="viewportband"/>')
+    elif target_positions:
+        first,last=target_positions[0],target_positions[-1]
+        out.append(f'<rect x="{left+first*xstep:.1f}" y="{top}" width="{(last-first+1)*xstep:.1f}" height="{chart_h+vol_h+8}" class="d0band"/>')
     elif target_idx is not None:
         out.append(f'<rect x="{left+target_idx*xstep:.1f}" y="{top}" width="{xstep:.1f}" height="{chart_h+vol_h+8}" class="d0band"/>')
     if signal_idx is not None: out.append(f'<line x1="{xs[signal_idx]:.1f}" x2="{xs[signal_idx]:.1f}" y1="{top}" y2="{vol_top+vol_h}" class="sigline"/>')

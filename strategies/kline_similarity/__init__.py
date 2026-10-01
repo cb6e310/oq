@@ -14,6 +14,7 @@ from .engine import (
     SimilarityMatch,
     aggregate_bars,
 )
+from .visualize import build_visual_results
 
 __all__ = [
     "KlineSimilarityEngine",
@@ -22,4 +23,5 @@ __all__ = [
     "SimilarityConfig",
     "SimilarityMatch",
     "aggregate_bars",
+    "build_visual_results",
 ]
