@@ -6,6 +6,8 @@ import numpy as np
 import pandas as pd
 
 from strategies.kline_similarity import KlineSimilarityEngine, SimilarityConfig, aggregate_bars, build_visual_results
+from strategies.kline_similarity.engine import _event_features
+from strategies.kline_similarity.engine import _constrained_dtw, _global_nms, SimilarityMatch
 
 
 def _bars(phase=0.0, n=180):
@@ -65,10 +67,37 @@ class EngineTests(unittest.TestCase):
                                           history_only=False)
             self.assertEqual(len(result), 3)
             self.assertTrue(all(Path(x["image_path"]).exists() for x in result))
+            self.assertTrue(all(set(x["image_paths"]) == {"daily", "weekly", "monthly"} for x in result))
+            self.assertTrue(all(Path(x["image_paths"][p]).exists() for x in result for p in ("daily", "weekly", "monthly")))
             self.assertTrue(all("interval" in x and x["timeframe"] == "1d" for x in result))
             html = Path(result[0]["html_path"]).read_text(encoding="utf-8")
-            self.assertIn("前后各44根", html)
+            self.assertIn("前后各90根", html)
+            self.assertIn("前后各22根", html)
+            self.assertIn("weekly", html)
             self.assertIn("<svg", html)
+
+    def test_board_events_are_explicit_features(self):
+        frame = pd.DataFrame({
+            "date": pd.date_range("2026-01-01", periods=4),
+            "open": [10, 11, 12, 10.8], "high": [10, 11, 12, 11],
+            "low": [10, 11, 12, 10], "close": [10, 11, 12, 10],
+            "vol": [1, 1, 1, 1],
+        })
+        events = _event_features(frame, "600000.SH")
+        self.assertEqual(events.shape, (4, 4))
+        self.assertEqual(events[1, 0], 1.0)
+        self.assertEqual(events[1, 2], 1.0)
+
+    def test_banded_dtw_matches_reference_shape_and_interval_nms(self):
+        a = np.arange(30, dtype=float)[:, None]
+        b = (np.arange(30, dtype=float) + 0.5)[:, None]
+        self.assertAlmostEqual(_constrained_dtw(a, b, 2), 0.5 * np.sqrt(30 / 60), places=6)
+        base = dict(score=1.0, mass_distance=0.0, dtw_distance=0.0,
+                    aligned_distance=0.0, total_return_diff=0.0,
+                    volatility_diff=0.0, event_distance=0.0, window_length=10)
+        items = [SimilarityMatch("A", pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-10"), start_idx=0, end_idx=9, **base),
+                 SimilarityMatch("A", pd.Timestamp("2020-01-05"), pd.Timestamp("2020-01-14"), start_idx=4, end_idx=13, **base)]
+        self.assertEqual(len(_global_nms(items, 2, overlap_threshold=0.25)), 1)
 
 
 if __name__ == "__main__":

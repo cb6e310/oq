@@ -14,7 +14,12 @@ from .engine import (
     SimilarityMatch,
     aggregate_bars,
 )
-from .visualize import build_visual_results
+
+
+def build_visual_results(*args, **kwargs):
+    """Lazy import wrapper, keeping ``python -m ...visualize`` warning-free."""
+    from .visualize import build_visual_results as _build_visual_results
+    return _build_visual_results(*args, **kwargs)
 
 __all__ = [
     "KlineSimilarityEngine",

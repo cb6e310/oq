@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Iterable, Mapping, Protocol
+import heapq
 
 import numpy as np
 import pandas as pd
@@ -22,6 +23,7 @@ FEATURE_NAMES = (
     "r_close", "gap", "body_return", "upper_wick", "lower_wick",
     "range_pct", "volume_log_change",
 )
+EVENT_NAMES = ("limit_up", "limit_down", "one_word_up", "one_word_down")
 DEFAULT_FEATURE_WEIGHTS = np.array([2.0, 0.8, 1.2, 0.8, 0.8, 1.0, 0.6], dtype=float)
 
 
@@ -120,11 +122,14 @@ class SimilarityConfig:
     exclusion_ratio: float = 0.25
     sakoe_chiba_ratio: float = 0.08
     clip_value: float = 5.0
-    mass_weight: float = 0.20
-    dtw_weight: float = 0.35
-    aligned_weight: float = 0.25
-    return_weight: float = 0.15
+    mass_weight: float = 0.15
+    dtw_weight: float = 0.30
+    aligned_weight: float = 0.20
+    return_weight: float = 0.10
     volatility_weight: float = 0.05
+    special_event_weight: float = 0.20
+    event_recall_weight: float = 0.75
+    hard_event_match: bool = True
     use_volume: bool = True
     feature_weights: tuple[float, ...] = tuple(DEFAULT_FEATURE_WEIGHTS.tolist())
 
@@ -140,12 +145,16 @@ class SimilarityMatch:
     aligned_distance: float
     total_return_diff: float
     volatility_diff: float
+    event_distance: float = 0.0
     mass_rank: float = 0.0
     dtw_rank: float = 0.0
     aligned_rank: float = 0.0
     return_rank: float = 0.0
     volatility_rank: float = 0.0
+    event_rank: float = 0.0
     window_length: int = 0
+    start_idx: int = -1
+    end_idx: int = -1
 
     def to_dict(self) -> dict:
         result = asdict(self)
@@ -185,7 +194,13 @@ class KlineSimilarityEngine:
         tf = _normalize_timeframe(timeframe)
         query = _get_bars(self.provider, query_symbol, tf)
         start, end = pd.Timestamp(start_date), pd.Timestamp(end_date)
-        q = query[(query.date >= start) & (query.date <= end)].reset_index(drop=True)
+        q_source = query[(query.date >= start) & (query.date <= end)]
+        if q_source.empty:
+            raise ValueError("query interval has no complete K bars")
+        first_query_pos = int(q_source.index[0])
+        query_prev_close = (float(query.close.iloc[first_query_pos - 1])
+                            if first_query_pos > 0 else None)
+        q = q_source.reset_index(drop=True)
         if len(q) < 3:
             raise ValueError("query interval must contain at least three complete K bars")
         q = _valid_bars(q)
@@ -194,6 +209,7 @@ class KlineSimilarityEngine:
         m = len(q)
         q_close = np.log(q.close.to_numpy(float))
         q_features = _features(q, self.config.use_volume)
+        q_events = _event_features(q, query_symbol, previous_close=query_prev_close)
         candidates: list[dict] = []
         limit = int(recall_n or self.config.recall_n)
         for symbol in self.provider.get_symbols():
@@ -201,22 +217,46 @@ class KlineSimilarityEngine:
             if len(frame) < m:
                 continue
             distances = _mass_distances(q_close, np.log(frame.close.to_numpy(float)))
+            frame_events = _event_features(frame, str(symbol))
+            event_distances = _event_window_distances(q_events, frame_events)
+            recall_distances = distances + self.config.event_recall_weight * event_distances
+            # Mask illegal windows before local minima. Otherwise future or
+            # query-overlapping windows can consume the local_top_n budget.
+            legal = np.ones(len(distances), dtype=bool)
+            if history_only:
+                legal &= frame.date.to_numpy()[np.arange(len(distances)) + m - 1] < start.to_datetime64()
+            if exclude_query and str(symbol) == str(query_symbol):
+                self_legal = np.ones(len(legal), dtype=bool)
+                for idx in range(len(legal)):
+                    self_legal[idx] = _overlap_ratio(frame.date.iloc[idx], frame.date.iloc[idx + m - 1], start, end) <= 0.2
+                legal &= self_legal
+            recall_distances[~legal] = np.inf
+            event_distances[~legal] = np.inf
             radius = max(5, int(m * self.config.exclusion_ratio))
-            selected = _local_minima(distances, self.config.local_top_n, radius)
+            selected = _local_minima(recall_distances, self.config.local_top_n, radius)
+            selected = [(idx, value) for idx, value in selected if np.isfinite(value)]
+            # Event-bearing queries get a second, independent event shortlist.
+            # This prevents a strong close-shape window from crowding an exact
+            # limit-up/limit-down signature out of the per-stock recall list.
+            if float(q_events.sum()) > 0:
+                event_selected = _local_minima(event_distances, self.config.local_top_n, radius)
+                seen = {idx for idx, _ in selected}
+                selected.extend((idx, float(recall_distances[idx])) for idx, _ in event_selected if idx not in seen and np.isfinite(recall_distances[idx]))
             for idx, mass_distance in selected:
                 c_start, c_end = frame.date.iloc[idx], frame.date.iloc[idx + m - 1]
-                if history_only and c_end >= start:
-                    continue
-                if exclude_query and str(symbol) == str(query_symbol):
-                    overlap = _overlap_ratio(c_start, c_end, start, end)
-                    if overlap > 0.2:
-                        continue
-                candidates.append({"symbol": str(symbol), "frame": frame.iloc[idx:idx + m].reset_index(drop=True),
-                                   "mass_distance": float(mass_distance)})
-        candidates.sort(key=lambda x: x["mass_distance"])
+                candidates.append({"symbol": str(symbol),
+                                   "mass_distance": float(distances[idx]),
+                                   "event_distance": float(event_distances[idx]), "start_idx": idx,
+                                   "end_idx": idx + m - 1})
+        candidates = _bounded_candidates(candidates, limit, self.config.event_recall_weight)
         candidates = candidates[:limit]
         if not candidates:
             return []
+        # Only now materialize OHLCV windows for the bounded Stage-2 set.
+        # Stage 1 candidates remain metadata-only across the full universe.
+        for item in candidates:
+            bars = _valid_bars(_get_bars(self.provider, item["symbol"], tf))
+            item["frame"] = bars.iloc[item["start_idx"]:item["end_idx"] + 1].reset_index(drop=True)
         # Global robust feature scale.  Median/IQR is deliberately computed
         # over the query and recalled windows, avoiding a second full-market pass.
         matrices = [q_features] + [_features(c["frame"], self.config.use_volume) for c in candidates]
@@ -232,6 +272,13 @@ class KlineSimilarityEngine:
             raw = _features(item["frame"], self.config.use_volume)
             cn = np.clip((raw - med) / (iqr + 1e-9), -self.config.clip_value, self.config.clip_value)
             weighted_q, weighted_c = qn * np.sqrt(weights), cn * np.sqrt(weights)
+            candidate_events = _event_features(item["frame"], item["symbol"])
+            # Event channels are deliberately not robust-scaled: 0/1 event
+            # identity must remain visible to DTW and cannot be washed out by
+            # a large cross-market IQR.
+            event_scale = np.sqrt(max(self.config.special_event_weight, 0.0))
+            weighted_q = np.hstack([weighted_q, q_events * event_scale])
+            weighted_c = np.hstack([weighted_c, candidate_events * event_scale])
             dtw_distance = _constrained_dtw(weighted_q, weighted_c,
                                              max(1, round(m * self.config.sakoe_chiba_ratio)))
             aligned = float(np.sqrt(np.mean(np.sum((weighted_q - weighted_c) ** 2, axis=1))))
@@ -244,11 +291,20 @@ class KlineSimilarityEngine:
                 symbol=item["symbol"], start_date=cframe.date.iloc[0], end_date=cframe.date.iloc[-1],
                 score=0.0, mass_distance=item["mass_distance"], dtw_distance=dtw_distance,
                 aligned_distance=aligned, total_return_diff=abs(qret - cret),
+                event_distance=float(np.sqrt(np.mean((q_events - candidate_events) ** 2))),
                 volatility_diff=float(abs(np.log((cvol + 1e-9) / (qvol + 1e-9)))), window_length=m,
+                start_idx=item["start_idx"], end_idx=item["end_idx"],
             ))
         _assign_rank_scores(metrics, self.config)
-        metrics.sort(key=lambda x: (-x.score, x.symbol, x.start_date))
-        return _global_nms(metrics, top_k or self.config.top_k, radius=max(5, int(m * self.config.exclusion_ratio)))
+        if self.config.hard_event_match and float(q_events.sum()) > 0:
+            # When the query contains board events, exact event-signature
+            # windows are ranked before ordinary price-shape matches.  If
+            # fewer than top_k exact matches exist, the remaining slots are
+            # filled by the normal score ordering.
+            metrics.sort(key=lambda x: (x.event_distance, -x.score, x.symbol, x.start_date))
+        else:
+            metrics.sort(key=lambda x: (-x.score, x.symbol, x.start_date))
+        return _global_nms(metrics, top_k or self.config.top_k, overlap_threshold=self.config.exclusion_ratio)
 
 
 def _valid_bars(frame: pd.DataFrame) -> pd.DataFrame:
@@ -287,6 +343,51 @@ def _features(frame: pd.DataFrame, use_volume: bool = True) -> np.ndarray:
     return result
 
 
+def _limit_pct(symbol: str | None) -> float:
+    """Best-effort board limit based on A-share code when ST metadata is absent."""
+    code = str(symbol or "").split(".")[0]
+    if code.startswith(("300", "301", "688", "689")):
+        return 0.20
+    if code.startswith(("4", "8")):
+        return 0.30
+    return 0.10
+
+
+def _event_features(frame: pd.DataFrame, symbol: str | None = None,
+                    previous_close: float | None = None) -> np.ndarray:
+    """Return independent limit-up/down and one-word event channels.
+
+    A one-word board is detected from OHLC equality and a board-sized return.
+    Prices are rounded to cents before equality checks, matching Chinese daily
+    limit-price quotation.  For weekly/monthly bars this is a conservative
+    period-level approximation; daily searches use exact daily events.
+    """
+    close = frame.close.to_numpy(float)
+    open_ = frame.open.to_numpy(float)
+    high = frame.high.to_numpy(float)
+    low = frame.low.to_numpy(float)
+    prev = np.r_[close[0] if previous_close is None else previous_close, close[:-1]]
+    ret = close / np.maximum(prev, 1e-12) - 1.0
+    limit = _limit_pct(symbol)
+    tolerance = 0.015 if limit <= 0.10 else 0.02
+    up = np.abs(ret - limit) <= tolerance
+    down = np.abs(ret + limit) <= tolerance
+    equal = (np.round(open_, 2) == np.round(high, 2)) & (np.round(high, 2) == np.round(low, 2)) & (np.round(low, 2) == np.round(close, 2))
+    return np.column_stack([up.astype(float), down.astype(float),
+                            (up & equal).astype(float), (down & equal).astype(float)])
+
+
+def _event_window_distances(query_events: np.ndarray, series_events: np.ndarray) -> np.ndarray:
+    m = len(query_events)
+    if len(series_events) < m:
+        return np.empty(0)
+    windows = np.lib.stride_tricks.sliding_window_view(series_events, m, axis=0)
+    # sliding_window_view places the window dimension last for a 2-D input.
+    if windows.shape[1] != m:
+        windows = np.swapaxes(windows, 1, 2)
+    return np.sqrt(np.mean((windows - query_events[None, :, :]) ** 2, axis=(1, 2)))
+
+
 def _mass_distances(query: np.ndarray, series: np.ndarray) -> np.ndarray:
     m, n = len(query), len(series)
     if n < m:
@@ -296,6 +397,21 @@ def _mass_distances(query: np.ndarray, series: np.ndarray) -> np.ndarray:
     means, stds = windows.mean(axis=1), windows.std(axis=1)
     z = (windows - means[:, None]) / np.maximum(stds[:, None], 1e-12)
     return np.sqrt(np.mean((z - q[None, :]) ** 2, axis=1))
+
+
+def _bounded_candidates(candidates: list[dict], limit: int, event_weight: float) -> list[dict]:
+    """Keep only the global best recall candidates without retaining all ties."""
+    if len(candidates) <= limit:
+        return sorted(candidates, key=lambda x: x["mass_distance"] + event_weight * x["event_distance"])
+    heap: list[tuple[float, int, dict]] = []
+    for serial, item in enumerate(candidates):
+        key = item["mass_distance"] + event_weight * item["event_distance"]
+        entry = (-float(key), serial, item)
+        if len(heap) < limit:
+            heapq.heappush(heap, entry)
+        elif entry > heap[0]:
+            heapq.heapreplace(heap, entry)
+    return [x[2] for x in sorted(heap, key=lambda x: -x[0])]
 
 
 def _local_minima(distances: np.ndarray, count: int, radius: int) -> list[tuple[int, float]]:
@@ -311,16 +427,20 @@ def _local_minima(distances: np.ndarray, count: int, radius: int) -> list[tuple[
 
 
 def _constrained_dtw(a: np.ndarray, b: np.ndarray, radius: int) -> float:
+    """Banded rolling-row constrained DTW; memory is O(window * features)."""
     n, m = len(a), len(b)
     inf = float("inf")
-    cost = np.full((n + 1, m + 1), inf)
-    cost[0, 0] = 0.0
+    prev = np.full(m + 1, inf)
+    curr = np.full(m + 1, inf)
+    prev[0] = 0.0
     for i in range(1, n + 1):
+        curr.fill(inf)
         lo, hi = max(1, i - radius), min(m, i + radius)
         for j in range(lo, hi + 1):
             d = float(np.sum((a[i - 1] - b[j - 1]) ** 2))
-            cost[i, j] = d + min(cost[i - 1, j], cost[i, j - 1], cost[i - 1, j - 1])
-    return float(np.sqrt(cost[n, m] / max(n + m, 1)))
+            curr[j] = d + min(prev[j], curr[j - 1], prev[j - 1])
+        prev, curr = curr, prev
+    return float(np.sqrt(prev[m] / max(n + m, 1)))
 
 
 def _rank(values: Iterable[float]) -> np.ndarray:
@@ -336,12 +456,12 @@ def _rank(values: Iterable[float]) -> np.ndarray:
 def _assign_rank_scores(items: list[SimilarityMatch], config: SimilarityConfig) -> None:
     rs = [_rank([x.mass_distance for x in items]), _rank([x.dtw_distance for x in items]),
           _rank([x.aligned_distance for x in items]), _rank([x.total_return_diff for x in items]),
-          _rank([x.volatility_diff for x in items])]
+          _rank([x.volatility_diff for x in items]), _rank([x.event_distance for x in items])]
     for i, item in enumerate(items):
-        item.mass_rank, item.dtw_rank, item.aligned_rank, item.return_rank, item.volatility_rank = [float(x[i]) for x in rs]
+        item.mass_rank, item.dtw_rank, item.aligned_rank, item.return_rank, item.volatility_rank, item.event_rank = [float(x[i]) for x in rs]
         distance = (config.mass_weight * item.mass_rank + config.dtw_weight * item.dtw_rank +
                     config.aligned_weight * item.aligned_rank + config.return_weight * item.return_rank +
-                    config.volatility_weight * item.volatility_rank)
+                    config.volatility_weight * item.volatility_rank + config.special_event_weight * item.event_rank)
         item.score = float(1.0 - distance)
 
 
@@ -352,12 +472,19 @@ def _overlap_ratio(a_start, a_end, b_start, b_end) -> float:
     return (right - left).days / max((pd.Timestamp(b_end) - pd.Timestamp(b_start)).days + 1, 1)
 
 
-def _global_nms(items: list[SimilarityMatch], top_k: int, radius: int) -> list[SimilarityMatch]:
+def _global_nms(items: list[SimilarityMatch], top_k: int, overlap_threshold: float = 0.25) -> list[SimilarityMatch]:
     selected: list[SimilarityMatch] = []
     for item in items:
-        if any(item.symbol == old.symbol and abs((item.start_date - old.start_date).days) <= radius for old in selected):
+        if any(item.symbol == old.symbol and _interval_overlap(item.start_idx, item.end_idx, old.start_idx, old.end_idx) > overlap_threshold for old in selected):
             continue
         selected.append(item)
         if len(selected) >= top_k:
             break
     return selected
+
+
+def _interval_overlap(start_a: int, end_a: int, start_b: int, end_b: int) -> float:
+    if min(end_a, end_b) < max(start_a, start_b):
+        return 0.0
+    intersection = min(end_a, end_b) - max(start_a, start_b) + 1
+    return intersection / max(min(end_a - start_a + 1, end_b - start_b + 1), 1)
