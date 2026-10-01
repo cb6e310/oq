@@ -69,6 +69,9 @@ class EngineTests(unittest.TestCase):
             self.assertTrue(all(Path(x["image_path"]).exists() for x in result))
             self.assertTrue(all(set(x["image_paths"]) == {"daily", "weekly", "monthly"} for x in result))
             self.assertTrue(all(Path(x["image_paths"][p]).exists() for x in result for p in ("daily", "weekly", "monthly")))
+            svg = Path(result[0]["image_paths"]["daily"]).read_text(encoding="utf-8")
+            self.assertIn('xmlns="http://www.w3.org/2000/svg"', svg)
+            self.assertIn("<style>", svg)
             self.assertTrue(all("interval" in x and x["timeframe"] == "1d" for x in result))
             html = Path(result[0]["html_path"]).read_text(encoding="utf-8")
             self.assertIn("前后各90根", html)
@@ -87,6 +90,32 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(events.shape, (4, 4))
         self.assertEqual(events[1, 0], 1.0)
         self.assertEqual(events[1, 2], 1.0)
+
+        # A normal +9% candle must not be promoted to a 10% limit-up event.
+        ordinary = frame.copy()
+        ordinary[["open", "high", "low", "close"]] = ordinary[["open", "high", "low", "close"]].astype(float)
+        ordinary.loc[1, ["open", "high", "low", "close"]] = [10.2, 10.9, 10.1, 10.9]
+        ordinary_events = _event_features(ordinary, "600000.SH")
+        self.assertEqual(ordinary_events[1, 0], 0.0)
+
+    def test_event_queries_are_still_sorted_by_displayed_score(self):
+        # A query containing a one-word limit-up bar used to activate an
+        # event-distance-first sort, which could make displayed scores rise
+        # between adjacent ranks.
+        provider = Provider()
+        provider.data["A"].loc[60, ["open", "high", "low", "close"]] = 10.0
+        provider.data["A"].loc[59, "close"] = 9.0
+        provider.data["A"].loc[62, ["open", "high", "low", "close"]] = 11.1
+        provider.data["B"].loc[60, ["open", "high", "low", "close"]] = 10.0
+        provider.data["B"].loc[59, "close"] = 9.0
+        provider.data["B"].loc[62, ["open", "high", "low", "close"]] = 11.1
+        engine = KlineSimilarityEngine(
+            provider, SimilarityConfig(local_top_n=3, recall_n=20, top_k=5)
+        )
+        result = engine.search("A", "2020-03-01", "2020-03-10", history_only=False)
+        self.assertTrue(result)
+        scores = [item.score for item in result]
+        self.assertEqual(scores, sorted(scores, reverse=True))
 
     def test_banded_dtw_matches_reference_shape_and_interval_nms(self):
         a = np.arange(30, dtype=float)[:, None]

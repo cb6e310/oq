@@ -244,10 +244,12 @@ class KlineSimilarityEngine:
                 selected.extend((idx, float(recall_distances[idx])) for idx, _ in event_selected if idx not in seen and np.isfinite(recall_distances[idx]))
             for idx, mass_distance in selected:
                 c_start, c_end = frame.date.iloc[idx], frame.date.iloc[idx + m - 1]
+                previous_close = float(frame.close.iloc[idx - 1]) if idx > 0 else None
                 candidates.append({"symbol": str(symbol),
                                    "mass_distance": float(distances[idx]),
                                    "event_distance": float(event_distances[idx]), "start_idx": idx,
-                                   "end_idx": idx + m - 1})
+                                   "end_idx": idx + m - 1,
+                                   "previous_close": previous_close})
         candidates = _bounded_candidates(candidates, limit, self.config.event_recall_weight)
         candidates = candidates[:limit]
         if not candidates:
@@ -272,7 +274,14 @@ class KlineSimilarityEngine:
             raw = _features(item["frame"], self.config.use_volume)
             cn = np.clip((raw - med) / (iqr + 1e-9), -self.config.clip_value, self.config.clip_value)
             weighted_q, weighted_c = qn * np.sqrt(weights), cn * np.sqrt(weights)
-            candidate_events = _event_features(item["frame"], item["symbol"])
+            # The first bar of a candidate must be compared with the close
+            # immediately before the window.  Recomputing events on the
+            # sliced frame alone would silently lose a first-bar limit-up or
+            # limit-down event (the most important event in many queries).
+            candidate_prev_close = item.get("previous_close")
+            candidate_events = _event_features(
+                item["frame"], item["symbol"], previous_close=candidate_prev_close
+            )
             # Event channels are deliberately not robust-scaled: 0/1 event
             # identity must remain visible to DTW and cannot be washed out by
             # a large cross-market IQR.
@@ -295,15 +304,13 @@ class KlineSimilarityEngine:
                 volatility_diff=float(abs(np.log((cvol + 1e-9) / (qvol + 1e-9)))), window_length=m,
                 start_idx=item["start_idx"], end_idx=item["end_idx"],
             ))
-        _assign_rank_scores(metrics, self.config)
-        if self.config.hard_event_match and float(q_events.sum()) > 0:
-            # When the query contains board events, exact event-signature
-            # windows are ranked before ordinary price-shape matches.  If
-            # fewer than top_k exact matches exist, the remaining slots are
-            # filled by the normal score ordering.
-            metrics.sort(key=lambda x: (x.event_distance, -x.score, x.symbol, x.start_date))
-        else:
-            metrics.sort(key=lambda x: (-x.score, x.symbol, x.start_date))
+        _assign_rank_scores(metrics, self.config, event_active=float(q_events.sum()) > 0)
+        # Event features still affect both recall and the composite score
+        # (and therefore remain a hard consideration for board-event-heavy
+        # queries), but the public ranking must be ordered by the displayed
+        # similarity score.  Sorting by event distance first made a lower
+        # score appear above a higher score in the UI.
+        metrics.sort(key=lambda x: (-x.score, x.symbol, x.start_date))
         return _global_nms(metrics, top_k or self.config.top_k, overlap_threshold=self.config.exclusion_ratio)
 
 
@@ -367,11 +374,15 @@ def _event_features(frame: pd.DataFrame, symbol: str | None = None,
     high = frame.high.to_numpy(float)
     low = frame.low.to_numpy(float)
     prev = np.r_[close[0] if previous_close is None else previous_close, close[:-1]]
-    ret = close / np.maximum(prev, 1e-12) - 1.0
     limit = _limit_pct(symbol)
-    tolerance = 0.015 if limit <= 0.10 else 0.02
-    up = np.abs(ret - limit) <= tolerance
-    down = np.abs(ret + limit) <= tolerance
+    # A-share limit prices are quoted to cents.  Use the rounded theoretical
+    # limit price rather than a broad percentage band (e.g. 8.5%~11.5%),
+    # otherwise ordinary large candles are incorrectly treated as boards.
+    valid_prev = np.isfinite(prev) & (prev > 0)
+    up_price = np.round(prev * (1.0 + limit), 2)
+    down_price = np.round(prev * (1.0 - limit), 2)
+    up = valid_prev & (np.abs(close - up_price) <= 0.011)
+    down = valid_prev & (np.abs(close - down_price) <= 0.011)
     equal = (np.round(open_, 2) == np.round(high, 2)) & (np.round(high, 2) == np.round(low, 2)) & (np.round(low, 2) == np.round(close, 2))
     return np.column_stack([up.astype(float), down.astype(float),
                             (up & equal).astype(float), (down & equal).astype(float)])
@@ -453,7 +464,8 @@ def _rank(values: Iterable[float]) -> np.ndarray:
     return ranks
 
 
-def _assign_rank_scores(items: list[SimilarityMatch], config: SimilarityConfig) -> None:
+def _assign_rank_scores(items: list[SimilarityMatch], config: SimilarityConfig,
+                        event_active: bool = False) -> None:
     rs = [_rank([x.mass_distance for x in items]), _rank([x.dtw_distance for x in items]),
           _rank([x.aligned_distance for x in items]), _rank([x.total_return_diff for x in items]),
           _rank([x.volatility_diff for x in items]), _rank([x.event_distance for x in items])]
@@ -463,6 +475,16 @@ def _assign_rank_scores(items: list[SimilarityMatch], config: SimilarityConfig) 
                     config.aligned_weight * item.aligned_rank + config.return_weight * item.return_rank +
                     config.volatility_weight * item.volatility_rank + config.special_event_weight * item.event_rank)
         item.score = float(1.0 - distance)
+        # ``hard_event_match`` gives exact event signatures a clear priority
+        # band, while keeping a continuous penalty among non-exact windows.
+        # This avoids collapsing every result below 0.5 when the market has
+        # no perfect historical event sequence.
+        if config.hard_event_match and event_active:
+            base_score = item.score
+            if item.event_distance <= 1e-12:
+                item.score = 0.5 + 0.5 * base_score
+            else:
+                item.score = 0.5 * base_score - 0.5 * min(item.event_distance, 1.0)
 
 
 def _overlap_ratio(a_start, a_end, b_start, b_end) -> float:

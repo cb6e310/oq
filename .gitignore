@@ -21,3 +21,6 @@ Thumbs.db
 
 # script outputs
 results/
+strategies/kline_similarity/ui_results/
+strategies/kline_similarity/query_history.json
+strategies/kline_similarity/ui_launcher.log

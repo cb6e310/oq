@@ -93,9 +93,17 @@ def render_chart(bars,title,subtitle="",target_date=None,signal_date=None,period
         if col not in bars:continue
         pts=" ".join(f"{xs[i]:.1f},{py(v):.1f}" for i,v in enumerate(bars[col].values) if np.isfinite(v)); out.append(f'<polyline points="{pts}" fill="none" stroke="{color}" stroke-width="1.2"/>')
     for i,r in bars.iterrows():
-        x=xs[i]; color="#e74c3c" if r.close>=r.open else "#16a085"; out.append(f'<line x1="{x:.1f}" x2="{x:.1f}" y1="{py(r.high):.1f}" y2="{py(r.low):.1f}" stroke="{color}" stroke-width="1"/>'); y0,y1=py(max(r.open,r.close)),py(min(r.open,r.close)); out.append(f'<rect x="{x-xstep*.31:.1f}" y="{y0:.1f}" width="{max(xstep*.62,1):.1f}" height="{max(y1-y0,1):.1f}" fill="{color}"/>')
+        x=xs[i]
+        board_type = str(r.get("board_type", "")) if period == "D" else ""
+        board_colors = {"limit_up":"#ff1493", "one_word_up":"#8b0000",
+                        "limit_down":"#00a6a6", "one_word_down":"#006400"}
+        color=board_colors.get(board_type, "#e74c3c" if r.close>=r.open else "#16a085")
+        out.append(f'<line x1="{x:.1f}" x2="{x:.1f}" y1="{py(r.high):.1f}" y2="{py(r.low):.1f}" stroke="{color}" stroke-width="1"/>'); y0,y1=py(max(r.open,r.close)),py(min(r.open,r.close)); out.append(f'<rect x="{x-xstep*.31:.1f}" y="{y0:.1f}" width="{max(xstep*.62,1):.1f}" height="{max(y1-y0,1):.1f}" fill="{color}"/>')
         if show_volume: out.append(f'<rect x="{x-xstep*.31:.1f}" y="{vy(r.vol):.1f}" width="{max(xstep*.62,1):.1f}" height="{max(vol_top+vol_h-vy(r.vol),1):.1f}" fill="{color}" opacity=".45"/>')
     if show_volume:out.append(f'<line x1="{left}" x2="{width-right}" y1="{vol_top}" y2="{vol_top}" class="volline"/>')
+    if period == "D" and "board_type" in bars and bars.board_type.astype(str).isin(["limit_up", "one_word_up", "limit_down", "one_word_down"]).any():
+        for lx,color,label in ((left,"#ff1493","涨停"),(left+62,"#00a6a6","跌停"),(left+124,"#8b0000","一字涨停"),(left+204,"#006400","一字跌停")):
+            out.append(f'<rect x="{lx:.1f}" y="{top-18:.1f}" width="9" height="9" fill="{color}"/><text x="{lx+12:.1f}" y="{top-10:.1f}" class="axis">{label}</text>')
     label_y=height-8
     if target_idx is not None:
         target_label = {"D": "D0一字", "W": "D0所在周", "M": "D0所在月"}[period]

@@ -9,10 +9,28 @@ from pathlib import Path
 
 import pandas as pd
 
-from .engine import KlineSimilarityEngine, ParquetDataProvider, SimilarityConfig, _normalize_timeframe
+from .engine import (KlineSimilarityEngine, ParquetDataProvider, SimilarityConfig,
+                      _event_features, _normalize_timeframe)
 
 
 _PERIOD = {"1d": "D", "1w": "W", "1m": "M"}
+_SVG_CSS = (".panel{display:block;width:100%;height:auto}.title{font-size:14px;font-weight:600;fill:#222}"
+            ".sub,.axis,.mark{font-size:11px;fill:#666}.targetmark{fill:#9a6700}.signalmark{fill:#315d9e}"
+            ".grid{stroke:#e6e6e6;stroke-width:1}.d0band{fill:#fff2a8;opacity:.72}"
+            ".viewportband{fill:#fff2a8;opacity:.45}.sigline{stroke:#315d9e;stroke-width:1.2;stroke-dasharray:4 3}"
+            ".volline{stroke:#bbb;stroke-width:1}")
+
+
+def standalone_svg(svg: str) -> str:
+    """Make renderer output valid and self-contained when used by an img tag."""
+    if not svg.lstrip().startswith("<svg"):
+        return svg
+    if "xmlns=" not in svg[:300]:
+        svg = svg.replace("<svg", '<svg xmlns="http://www.w3.org/2000/svg"', 1)
+    if "<style>" not in svg[:1000]:
+        first_close = svg.find(">")
+        svg = svg[:first_close + 1] + f"<style>{_SVG_CSS}</style>" + svg[first_close + 1:]
+    return svg
 
 
 def _chart_tools():
@@ -51,6 +69,26 @@ def _bar_overlaps(bars: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp, pe
     return (left <= end) & (right >= start)
 
 
+def _annotate_daily_events(bars: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    """Attach daily board-event labels consumed by the SVG renderer."""
+    out = bars.copy()
+    events = _event_features(out, symbol)
+    labels = []
+    for up, down, one_up, one_down in events:
+        if one_up:
+            labels.append("one_word_up")
+        elif one_down:
+            labels.append("one_word_down")
+        elif up:
+            labels.append("limit_up")
+        elif down:
+            labels.append("limit_down")
+        else:
+            labels.append("")
+    out["board_type"] = labels
+    return out
+
+
 def build_visual_results(
     engine: KlineSimilarityEngine,
     query_symbol: str,
@@ -83,7 +121,9 @@ def build_visual_results(
         raise ValueError("query interval has no bars in the selected timeframe")
     results = []
     for rank, match in enumerate(matches, 1):
-        daily_bars = aggregate_bars(engine.provider.get_symbol_data(match.symbol), "D")
+        daily_bars = _annotate_daily_events(
+            aggregate_bars(engine.provider.get_symbol_data(match.symbol), "D"), match.symbol
+        )
         target_start, target_end = _calendar_range(pd.Timestamp(match.start_date), pd.Timestamp(match.end_date), tf)
         daily_target = daily_bars[_bar_overlaps(daily_bars, target_start, target_end, "D")]
         if daily_target.empty:
@@ -108,24 +148,24 @@ def build_visual_results(
         daily_path = out / f"{stem}_daily.svg"
         weekly_path = out / f"{stem}_weekly.svg"
         monthly_path = out / f"{stem}_monthly.svg"
-        daily_path.write_text(render_chart(
+        daily_path.write_text(standalone_svg(render_chart(
             daily_window, f"{match.symbol} 日线 · 相似排名 {rank}",
             subtitle + " · 日线目标前后各90根",
             target_date=match.start_date, period="D", target_start=target_start, target_end=target_end,
-        ), encoding="utf-8")
+        )), encoding="utf-8")
         daily_range = (daily_window.date.min(), daily_window.date.max())
-        weekly_path.write_text(render_chart(
+        weekly_path.write_text(standalone_svg(render_chart(
             weekly_window, f"{match.symbol} 周线 · 相似排名 {rank}",
             subtitle + " · 周线目标前后各22根",
             target_date=match.start_date, period="W", range_start=daily_range[0], range_end=daily_range[1],
             target_start=target_start, target_end=target_end,
-        ), encoding="utf-8")
-        monthly_path.write_text(render_chart(
+        )), encoding="utf-8")
+        monthly_path.write_text(standalone_svg(render_chart(
             monthly_window, f"{match.symbol} 月线 · 相似排名 {rank}",
             subtitle + " · 月线目标前后各22根",
             target_date=match.start_date, period="M", range_start=daily_range[0], range_end=daily_range[1],
             target_start=target_start, target_end=target_end,
-        ), encoding="utf-8")
+        )), encoding="utf-8")
         item = match.to_dict()
         item.update({"rank": rank, "timeframe": tf, "interval": {
             "start_date": item["start_date"], "end_date": item["end_date"],
