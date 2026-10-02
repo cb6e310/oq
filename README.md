@@ -28,11 +28,14 @@ open_quant/
 ├── scripts/
 │   └── build_adjusted.py        # 解析 .day + gbbq，生成复权数据
 └── strategies/
-    ├── yizi_pullback_d2/        # 一字板回调策略
-    │   ├── strategy/            # 一字板回调策略代码
-    │   ├── results/             # 最终事件明细与统计
-    │   ├── figures/             # 图表素材
-    │   └── docs/                # 唯一完整回测与可视化报告
+    ├── analysis/                # 分析类策略
+    │   ├── yizi_pullback/    # 一字板回调策略
+    │   │   ├── strategy/        # 一字板回调策略代码
+    │   │   ├── results/         # 最终事件明细与统计
+    │   │   ├── figures/         # 图表素材
+    │   │   └── docs/            # 唯一完整回测与可视化报告
+    │   └── average_daily_amount_top50/ # 区间日均成交额排名
+    ├── kline_similarity/        # K 线相似度搜索
     └── ten_year_return/         # 长期收益研究
         ├── strategy/            # 长期收益脚本
         └── results/             # 长期收益结果
@@ -54,11 +57,14 @@ open_quant/
 │   ├── candlestick_svg.py               # 通用 K 线 SVG/手机长图绘图模块
 │   └── market_regimes.py                 # 跨策略统一牛熊时段划分
 ├── strategies/
-│   ├── yizi_pullback_d2/                # 一字板回调策略
-│   │   ├── strategy/                    # 形态识别、事件研究与图表脚本
-│   │   ├── results/                     # 最终事件明细与统计 CSV
-│   │   ├── figures/                     # 收益分布、K 线长图等素材
-│   │   └── docs/                        # 唯一完整回测与可视化报告
+│   ├── analysis/                         # 分析类策略
+│   │   ├── yizi_pullback/             # 一字板回调策略
+│   │   │   ├── strategy/                 # 形态识别、事件研究与图表脚本
+│   │   │   ├── results/                  # 最终事件明细与统计 CSV
+│   │   │   ├── figures/                  # 收益分布、K 线长图等素材
+│   │   │   └── docs/                     # 唯一完整回测与可视化报告
+│   │   └── average_daily_amount_top50/  # 区间日均成交额排名
+│   ├── kline_similarity/                # K 线相似度搜索
 │   └── ten_year_return/                 # 长期收益研究
 │       ├── strategy/ten_year_return.py
 │       └── results/ten_year_return_by_stock.csv
@@ -70,7 +76,7 @@ open_quant/
 
 - `database/` 只存放行情数据，不存放策略结果。
 - `scripts/` 只保留跨策略的数据构建工具。
-- 每个独立策略在 `strategies/<strategy_name>/` 下自包含代码、结果、图表和文档。
+- 分析类策略在 `strategies/analysis/<strategy_name>/` 下自包含代码、结果、图表和文档。
 - 项目根目录不保留 `results/`，策略结果仅保存在对应策略目录内。
 - `strategies/test/` 已删除。
 
@@ -106,8 +112,8 @@ events["market_regime"] = market_regime_series(events["signal_date"])
 ### K 线图绘制规范
 
 项目中的样本图由 `scripts/candlestick_svg.py` 统一绘制，策略脚本只负责选择样本、准备事件日期和加载行情。当前一字板策略的入口是
-`strategies/yizi_pullback_d2/strategy/make_yizi_mobile_charts.py`，输出到
-`strategies/yizi_pullback_d2/figures/yizi-mobile-k-lines.html`。
+`strategies/analysis/yizi_pullback/strategy/make_representative_charts.py`，输出到
+`strategies/analysis/yizi_pullback/figures/representative-samples.html`。
 
 绘图逻辑固定如下：
 
@@ -131,8 +137,8 @@ events["market_regime"] = market_regime_series(events["signal_date"])
 
 其他策略可以复用该模块，只需提供标准字段 `date/open/high/low/close/vol`，以及目标日期、信号日期和跨周期视窗范围。
 
-本策略另提供固定随机种子的抽样长图：`strategies/yizi_pullback_d2/strategy/make_yizi_random_charts.py` 输出
-`strategies/yizi_pullback_d2/figures/yizi-random-positive-negative-k-lines.html`，从有效 T+20 样本中随机抽取正收益 50 个与负收益 50 个；抽样种子为 `20260930`，结果可复现。
+本策略另提供回调分组样本长图：`strategies/analysis/yizi_pullback/strategy/make_pullback_charts.py` 输出
+`strategies/analysis/yizi_pullback/figures/pullback-samples.html`，展示全部暴力回调及固定抽取的中等回调样本。
 
 ## 数据来源与更新
 
@@ -250,9 +256,10 @@ daily = daily.merge(basic[["ts_code", "name", "industry"]], on="ts_code", how="l
 |---|---|
 | `scripts/download_stock_basic.py` | 从 Tushare 下载全 A 股名称、行业、上市状态、上市/退市日期等基础信息 |
 | `strategies/ten_year_return/strategy/ten_year_return.py` | 全部股票近 N 年的持有收益（后复权、包含退市股）；每日再平衡的等权组合对比沪深300、上证指数 |
-| `strategies/yizi_pullback_d2/strategy/event_study.py` | 事件研究通用模块 |
-| `strategies/yizi_pullback_d2/strategy/pattern_yizi_pullback.py` | 一字板回调形态识别与回测（当前正式策略口径） |
-| `strategies/yizi_pullback_d2/strategy/regime_t20_analysis.py` | 按固定牛熊区间分析 T+20 正负收益相关性，并生成图表 |
+| `strategies/analysis/yizi_pullback/strategy/event_study.py` | 事件研究通用模块 |
+| `strategies/analysis/yizi_pullback/strategy/pattern.py` | 一字板回调形态识别与回测（当前正式策略口径） |
+| `strategies/analysis/yizi_pullback/strategy/market_regime_analysis.py` | 按固定牛熊区间分析买入后 T+25 正负收益相关性，并生成图表 |
+| `strategies/analysis/average_daily_amount_top50/strategy/average_daily_amount_top50.py` | 按 `amount` 字段统计区间日均成交额前 N 只股票 |
 
 事件研究的统一口径：
 - 一字板回调策略额外要求：D0 后复权收盘价不高于此前约 3 个月（63 根有效日线）最低后复权低点的 1.2 倍，即涨幅不超过 20%；历史窗口不含 D0。

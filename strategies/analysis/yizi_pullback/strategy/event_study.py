@@ -13,7 +13,7 @@ import os
 import numpy as np
 import pandas as pd
 
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 STRATEGY_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DAILY = os.path.join(ROOT, "database", "processed", "stock_daily.parquet")
 RESULTS = os.path.join(STRATEGY_ROOT, "results")
@@ -42,9 +42,9 @@ def latest_date():
 def load_bars(start, lookback_days=120):
     """All stocks, sorted by (ts_code, date), from `start - lookback_days` onwards.
 
-    Adds: hfq_open/hfq_close, pct (hfq close-to-close), bar_no (0 = listing day, counted on
-    the full history), board, limit_pct, up_c/down_c (limit prices in cents), up5_c/down5_c
-    (5% limits for suspected ST on 主板), close_c, is_yizi (O=H=L=C), new_stock.
+    Adds: hfq_open/hfq_close/hfq_high/hfq_low, pct (hfq close-to-close), bar_no (0 = listing day,
+    counted on the full history), board, limit_pct, up_c/down_c (limit prices in cents),
+    up5_c/down5_c (5% limits for suspected ST on 主板), close_c, is_yizi (O=H=L=C), new_stock.
     """
     df = pd.read_parquet(DAILY)
     df = df.sort_values(["ts_code", "date"], kind="stable").reset_index(drop=True)
@@ -56,6 +56,7 @@ def load_bars(start, lookback_days=120):
     g = df.groupby("ts_code", observed=True)
     same = g.cumcount() > 0
     df["hfq_open"] = df.open * df.adj_factor
+    df["hfq_high"] = df.high * df.adj_factor
     df["hfq_close"] = df.close * df.adj_factor
     df["hfq_low"] = df.low * df.adj_factor
     df["pct"] = (df.hfq_close / g.hfq_close.shift() - 1).where(same)
@@ -175,6 +176,70 @@ def forward_returns(df, pos, horizons=(1, 3, 5, 10, 20), mkt=None):
         out[f"ret_open_{h}"] = np.where(ok, hc[jj] / ho[nx] - 1, np.nan)
         out[f"ex_open_{h}"] = out[f"ret_open_{h}"] - np.where(ok, mc[jj] / mo[nx] - 1, np.nan)
     return out
+
+
+def d3_low_bar_close_to_t25_best_close(df, d0_pos, signal_pos, horizon=25):
+    """Buy at the close of the lowest-low bar in D1-D3; sell at the best T+1..T+25 close.
+
+    Both selection of the D1-D3 bar and the best exit are retrospective. A
+    lowest-low bar before the D1/D2 signal is not a possible strategy entry;
+    that event has no valid entry rather than selecting a different bar.
+    T+1 excludes the buy bar in accordance with the one-day settlement rule.
+    Incomplete D1-D3 and T+25 windows produce no return.
+    """
+    d0 = np.asarray(d0_pos, dtype=int)
+    signals = np.asarray(signal_pos, dtype=int)
+    if len(d0) != len(signals):
+        raise ValueError("d0_pos and signal_pos must have the same length")
+    n = len(df)
+    codes = df.ts_code.cat.codes.values
+    lc = df.hfq_low.values
+    cc = df.hfq_close.values
+
+    start_close = np.full(len(d0), np.nan)
+    start_date = np.full(len(d0), np.datetime64("NaT"), dtype="datetime64[ns]")
+    start_pos = np.full(len(d0), -1, dtype=int)
+    end_close = np.full(len(d0), np.nan)
+    end_date = np.full(len(d0), np.datetime64("NaT"), dtype="datetime64[ns]")
+    end_pos = np.full(len(d0), -1, dtype=int)
+    horizon_date = np.full(len(d0), np.datetime64("NaT"), dtype="datetime64[ns]")
+
+    for i, k in enumerate(d0):
+        signal = signals[i]
+        if k < 0 or k + 3 >= n or signal <= k or signal > k + 3 or codes[k + 3] != codes[k]:
+            continue
+        entry_bars = np.arange(k + 1, k + 4)
+        if not np.isfinite(lc[entry_bars]).all():
+            continue
+        buy_idx = entry_bars[np.argmin(lc[entry_bars])]
+        if buy_idx < signal:
+            continue
+        last_idx = buy_idx + horizon
+        if last_idx >= n or codes[last_idx] != codes[k] or not np.isfinite(cc[buy_idx]) or cc[buy_idx] <= 0:
+            continue
+        sell_bars = np.arange(buy_idx + 1, last_idx + 1)
+        if not np.isfinite(cc[sell_bars]).all():
+            continue
+        sell_idx = sell_bars[np.argmax(cc[sell_bars])]
+        start_close[i] = cc[buy_idx]
+        start_date[i] = df.date.values[buy_idx]
+        start_pos[i] = buy_idx
+        end_close[i] = cc[sell_idx]
+        end_date[i] = df.date.values[sell_idx]
+        end_pos[i] = sell_idx
+        horizon_date[i] = df.date.values[last_idx]
+
+    ret = end_close / start_close - 1
+    return pd.DataFrame({
+        "return_start_close": start_close,
+        "return_start_date": start_date,
+        "return_start_pos": start_pos,
+        "return_end_close": end_close,
+        "return_end_date": end_date,
+        "return_end_pos": end_pos,
+        "return_horizon_date": horizon_date,
+        "ret_close_to_best_close_25": ret,
+    })
 
 
 def _stats(r, ex):

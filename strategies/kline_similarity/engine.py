@@ -13,7 +13,6 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Iterable, Mapping, Protocol
 import heapq
-
 import numpy as np
 import pandas as pd
 
@@ -118,7 +117,7 @@ class ParquetDataProvider:
 class SimilarityConfig:
     local_top_n: int = 20
     recall_n: int = 1000
-    top_k: int = 50
+    top_k: int = 20
     exclusion_ratio: float = 0.25
     sakoe_chiba_ratio: float = 0.08
     clip_value: float = 5.0
@@ -171,6 +170,7 @@ class KlineSimilarityEngine:
         self.config = config or SimilarityConfig()
         if len(self.config.feature_weights) != len(FEATURE_NAMES):
             raise ValueError("feature_weights must contain seven values")
+        self.last_search_stats: dict[str, int | float | str] = {}
 
     def search(
         self,
@@ -211,14 +211,24 @@ class KlineSimilarityEngine:
         q_features = _features(q, self.config.use_volume)
         q_events = _event_features(q, query_symbol, previous_close=query_prev_close)
         candidates: list[dict] = []
+        stats = {
+            "symbols_total": 0, "symbols_eligible": 0, "windows_total": 0,
+            "local_recall_total": 0, "mass_path_total": 0,
+            "structure_path_total": 0, "event_path_total": 0,
+            "candidates_before_global_limit": 0,
+        }
         limit = int(recall_n or self.config.recall_n)
         for symbol in self.provider.get_symbols():
+            stats["symbols_total"] += 1
             frame = _valid_bars(_get_bars(self.provider, symbol, tf))
             if len(frame) < m:
                 continue
+            stats["symbols_eligible"] += 1
             distances = _mass_distances(q_close, np.log(frame.close.to_numpy(float)))
+            structure_distances = _structure_distances(q, frame, self.config.use_volume)
             frame_events = _event_features(frame, str(symbol))
             event_distances = _event_window_distances(q_events, frame_events)
+            stats["windows_total"] += len(distances)
             recall_distances = distances + self.config.event_recall_weight * event_distances
             # Mask illegal windows before local minima. Otherwise future or
             # query-overlapping windows can consume the local_top_n budget.
@@ -232,28 +242,47 @@ class KlineSimilarityEngine:
                 legal &= self_legal
             recall_distances[~legal] = np.inf
             event_distances[~legal] = np.inf
+            structure_distances[~legal] = np.inf
             radius = max(5, int(m * self.config.exclusion_ratio))
             selected = _local_minima(recall_distances, self.config.local_top_n, radius)
             selected = [(idx, value) for idx, value in selected if np.isfinite(value)]
+            selected_paths: dict[int, set[str]] = {idx: {"mass"} for idx, _ in selected}
+            # A second cheap path recalls windows with similar candle bodies,
+            # gaps and shadows even when their closing-price trajectory is
+            # not close enough for the MASS path.
+            structure_selected = _local_minima(structure_distances, self.config.local_top_n, radius)
+            for idx, value in structure_selected:
+                if np.isfinite(value):
+                    selected_paths.setdefault(idx, set()).add("structure")
             # Event-bearing queries get a second, independent event shortlist.
             # This prevents a strong close-shape window from crowding an exact
             # limit-up/limit-down signature out of the per-stock recall list.
             if float(q_events.sum()) > 0:
                 event_selected = _local_minima(event_distances, self.config.local_top_n, radius)
-                seen = {idx for idx, _ in selected}
-                selected.extend((idx, float(recall_distances[idx])) for idx, _ in event_selected if idx not in seen and np.isfinite(recall_distances[idx]))
-            for idx, mass_distance in selected:
+                for idx, _ in event_selected:
+                    if np.isfinite(event_distances[idx]):
+                        selected_paths.setdefault(idx, set()).add("event")
+            stats["local_recall_total"] += len(selected_paths)
+            stats["mass_path_total"] += sum("mass" in paths for paths in selected_paths.values())
+            stats["structure_path_total"] += sum("structure" in paths for paths in selected_paths.values())
+            stats["event_path_total"] += sum("event" in paths for paths in selected_paths.values())
+            for idx, paths in selected_paths.items():
                 c_start, c_end = frame.date.iloc[idx], frame.date.iloc[idx + m - 1]
                 previous_close = float(frame.close.iloc[idx - 1]) if idx > 0 else None
                 candidates.append({"symbol": str(symbol),
                                    "mass_distance": float(distances[idx]),
                                    "event_distance": float(event_distances[idx]), "start_idx": idx,
-                                   "end_idx": idx + m - 1,
-                                   "previous_close": previous_close})
+                                   "end_idx": idx + m - 1, "previous_close": previous_close,
+                                   "recall_paths": "+".join(sorted(paths))})
+        stats["candidates_before_global_limit"] = len(candidates)
         candidates = _bounded_candidates(candidates, limit, self.config.event_recall_weight)
         candidates = candidates[:limit]
         if not candidates:
+            stats["candidates_after_global_limit"] = 0
+            stats["final_results"] = 0
+            self.last_search_stats = stats
             return []
+        stats["candidates_after_global_limit"] = len(candidates)
         # Only now materialize OHLCV windows for the bounded Stage-2 set.
         # Stage 1 candidates remain metadata-only across the full universe.
         for item in candidates:
@@ -311,7 +340,10 @@ class KlineSimilarityEngine:
         # similarity score.  Sorting by event distance first made a lower
         # score appear above a higher score in the UI.
         metrics.sort(key=lambda x: (-x.score, x.symbol, x.start_date))
-        return _global_nms(metrics, top_k or self.config.top_k, overlap_threshold=self.config.exclusion_ratio)
+        result = _global_nms(metrics, top_k or self.config.top_k, overlap_threshold=self.config.exclusion_ratio)
+        stats["final_results"] = len(result)
+        self.last_search_stats = stats
+        return result
 
 
 def _valid_bars(frame: pd.DataFrame) -> pd.DataFrame:
@@ -348,6 +380,28 @@ def _features(frame: pd.DataFrame, use_volume: bool = True) -> np.ndarray:
     if not use_volume:
         result[:, 6] = 0.0
     return result
+
+
+def _structure_distances(query: pd.DataFrame, series: pd.DataFrame,
+                         use_volume: bool = True) -> np.ndarray:
+    """Cheap candle-structure recall distance for every equal-length window.
+
+    This deliberately excludes the close-trajectory channel used by MASS and
+    compares gap/body/wicks/range (plus volume change when enabled).  It is a
+    recall signal only; the full OHLCV + event DTW remains the final judge.
+    """
+    qf = _features(query, use_volume)[:, 1:]
+    sf = _features(series, use_volume)[:, 1:]
+    m = len(qf)
+    if len(sf) < m:
+        return np.empty(0)
+    scale = np.nanstd(qf, axis=0)
+    scale = np.maximum(scale, 1e-3)
+    qn = qf / scale
+    windows = np.lib.stride_tricks.sliding_window_view(sf, m, axis=0)
+    if windows.ndim == 3 and windows.shape[1] != m:
+        windows = np.swapaxes(windows, 1, 2)
+    return np.sqrt(np.mean((windows / scale - qn[None, :, :]) ** 2, axis=(1, 2)))
 
 
 def _limit_pct(symbol: str | None) -> float:
@@ -414,6 +468,19 @@ def _bounded_candidates(candidates: list[dict], limit: int, event_weight: float)
     """Keep only the global best recall candidates without retaining all ties."""
     if len(candidates) <= limit:
         return sorted(candidates, key=lambda x: x["mass_distance"] + event_weight * x["event_distance"])
+    # Reserve part of the finite DTW budget for structure-path recalls so a
+    # close-shape-heavy market cannot crowd them all out.
+    structure_candidates = [x for x in candidates if "structure" in str(x.get("recall_paths", ""))]
+    reserve_n = min(max(1, limit // 3), len(structure_candidates))
+    reserved = _heap_best_candidates(structure_candidates, reserve_n, event_weight)
+    reserved_ids = {id(x) for x in reserved}
+    remainder = [x for x in candidates if id(x) not in reserved_ids]
+    return reserved + _heap_best_candidates(remainder, max(0, limit - len(reserved)), event_weight)
+
+
+def _heap_best_candidates(candidates: list[dict], limit: int, event_weight: float) -> list[dict]:
+    if limit <= 0 or not candidates:
+        return []
     heap: list[tuple[float, int, dict]] = []
     for serial, item in enumerate(candidates):
         key = item["mass_distance"] + event_weight * item["event_distance"]
@@ -460,7 +527,10 @@ def _rank(values: Iterable[float]) -> np.ndarray:
         return np.zeros(len(values))
     order = np.argsort(values, kind="mergesort")
     ranks = np.empty(len(values), dtype=float)
-    ranks[order] = np.arange(len(values), dtype=float) / (len(values) - 1)
+    sorted_values = values[order]
+    starts = np.r_[True, sorted_values[1:] != sorted_values[:-1]]
+    first_rank = np.maximum.accumulate(np.where(starts, np.arange(len(values)), 0))
+    ranks[order] = first_rank / (len(values) - 1)
     return ranks
 
 

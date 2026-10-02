@@ -6,8 +6,8 @@ import numpy as np
 import pandas as pd
 
 from strategies.kline_similarity import KlineSimilarityEngine, SimilarityConfig, aggregate_bars, build_visual_results
-from strategies.kline_similarity.engine import _event_features
-from strategies.kline_similarity.engine import _constrained_dtw, _global_nms, SimilarityMatch
+from strategies.kline_similarity.engine import _event_features, _rank, _structure_distances
+from strategies.kline_similarity.engine import _bounded_candidates, _constrained_dtw, _global_nms, SimilarityMatch
 
 
 def _bars(phase=0.0, n=180):
@@ -116,6 +116,35 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(result)
         scores = [item.score for item in result]
         self.assertEqual(scores, sorted(scores, reverse=True))
+
+    def test_equal_distances_share_rank_and_structure_recall_is_available(self):
+        np.testing.assert_array_equal(_rank([0.1, 0.1, 0.5]), [0.0, 0.0, 1.0])
+        query = _bars(0.0, 10)
+        series = _bars(0.2, 20)
+        distances = _structure_distances(query, series)
+        self.assertEqual(len(distances), len(series) - len(query) + 1)
+        self.assertTrue(np.isfinite(distances).all())
+
+    def test_global_recall_reserves_budget_for_structure_path(self):
+        items = [{"mass_distance": float(i) / 100, "event_distance": 0.0,
+                  "recall_paths": "mass"} for i in range(20)]
+        items += [{"mass_distance": 0.5 + float(i) / 100, "event_distance": 0.0,
+                   "recall_paths": "structure"} for i in range(8)]
+        selected = _bounded_candidates(items, 9, 0.75)
+        self.assertEqual(len(selected), 9)
+        self.assertGreaterEqual(sum("structure" in x["recall_paths"] for x in selected), 3)
+
+    def test_search_records_recall_statistics(self):
+        engine = KlineSimilarityEngine(
+            Provider(), SimilarityConfig(local_top_n=3, recall_n=10, top_k=3)
+        )
+        result = engine.search("A", "2020-04-01", "2020-04-30", history_only=False)
+        self.assertTrue(result)
+        stats = engine.last_search_stats
+        self.assertGreater(stats["symbols_eligible"], 0)
+        self.assertGreater(stats["windows_total"], 0)
+        self.assertGreaterEqual(stats["candidates_before_global_limit"], stats["candidates_after_global_limit"])
+        self.assertEqual(stats["final_results"], len(result))
 
     def test_banded_dtw_matches_reference_shape_and_interval_nms(self):
         a = np.arange(30, dtype=float)[:, None]

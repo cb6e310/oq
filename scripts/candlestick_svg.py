@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 import html
+import unicodedata
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -39,11 +40,39 @@ def centered_window(bars,target_date,period="D",before=22,after=22):
     if not len(found): return bars.iloc[0:0].copy()
     pos=int(found[0]); return bars.iloc[max(0,pos-before):min(len(bars),pos+after+1)].reset_index(drop=True)
 
-def render_chart(bars,title,subtitle="",target_date=None,signal_date=None,period="D",width=720,height=360,show_volume=True,range_start=None,range_end=None,target_start=None,target_end=None):
+def wrap_subtitle(subtitle, max_width):
+    def text_width(text):
+        return sum(11 if unicodedata.east_asian_width(char) in "WF" else 6.5 for char in text)
+
+    lines = []
+    line = ""
+    for part in str(subtitle).split(" · "):
+        candidate = f"{line} · {part}" if line else part
+        if text_width(candidate) <= max_width:
+            line = candidate
+            continue
+        if line:
+            lines.append(line)
+            line = ""
+        for char in part:
+            if line and text_width(line + char) > max_width:
+                lines.append(line)
+                line = ""
+            line += char
+    if line:
+        lines.append(line)
+    return lines
+
+def render_chart(bars,title,subtitle="",target_date=None,signal_date=None,period="D",width=720,height=360,show_volume=True,range_start=None,range_end=None,target_start=None,target_end=None,price_markers=None):
     """绘制单个周期 SVG；range_start/end 用于映射低周期完整视窗。"""
     bars=bars.reset_index(drop=True).copy()
     if bars.empty: return f'<svg viewBox="0 0 {width} 100" class="panel"><text x="12" y="50" class="title">{esc(title)}：无可用行情</text></svg>'
-    left,right,top,bottom=48,12,62,34; vol_h=54 if show_volume else 0; chart_h=height-top-bottom-vol_h-(8 if show_volume else 0); n=len(bars); xstep=(width-left-right)/max(n,1); xs=left+xstep*(np.arange(n)+.5)
+    subtitle_lines=wrap_subtitle(subtitle,width-24)
+    subtitle_last_y=42+15*(len(subtitle_lines)-1)
+    has_markers=period=="D" and bool(price_markers)
+    top=max(62,subtitle_last_y+(78 if has_markers else 20))
+    height+=top-62
+    left,right,bottom=48,12,34; vol_h=54 if show_volume else 0; chart_h=height-top-bottom-vol_h-(8 if show_volume else 0); n=len(bars); xstep=(width-left-right)/max(n,1); xs=left+xstep*(np.arange(n)+.5)
     # Price panels use a logarithmic coordinate system; volume remains linear.
     positive = bars[["low", "high"]].clip(lower=np.finfo(float).tiny)
     lo,hi=float(positive.low.min()),float(positive.high.max())
@@ -51,7 +80,8 @@ def render_chart(bars,title,subtitle="",target_date=None,signal_date=None,period
     lo,hi=np.exp(log_lo),np.exp(log_hi)
     py=lambda p: top+(log_hi-np.log(max(float(p),np.finfo(float).tiny)))/(log_hi-log_lo)*chart_h
     volmax=max(float(bars.vol.max()),1.0); vol_top=top+chart_h+8; vy=lambda v: vol_top+vol_h-v/volmax*vol_h
-    out=[f'<svg viewBox="0 0 {width} {height}" class="panel" role="img" aria-label="{esc(title)}">',f'<rect x="0" y="0" width="{width}" height="{height}" fill="#fff"/>',f'<text x="12" y="22" class="title">{esc(title)}</text>',f'<text x="12" y="42" class="sub">{esc(subtitle)}</text>']
+    out=[f'<svg viewBox="0 0 {width} {height}" class="panel" role="img" aria-label="{esc(title)}">',f'<rect x="0" y="0" width="{width}" height="{height}" fill="#fff"/>',f'<text x="12" y="22" class="title">{esc(title)}</text>']
+    out.extend(f'<text x="12" y="{42+15*index}" class="sub">{esc(line)}</text>' for index,line in enumerate(subtitle_lines))
     for frac in (0,.5,1):
         y=top+chart_h*frac; val=np.exp(log_hi-(log_hi-log_lo)*frac); out += [f'<line x1="{left}" x2="{width-right}" y1="{y:.1f}" y2="{y:.1f}" class="grid"/>',f'<text x="4" y="{y+4:.1f}" class="axis">{val:.2f}</text>']
     def locate(date):
@@ -89,6 +119,14 @@ def render_chart(bars,title,subtitle="",target_date=None,signal_date=None,period
     elif target_idx is not None:
         out.append(f'<rect x="{left+target_idx*xstep:.1f}" y="{top}" width="{xstep:.1f}" height="{chart_h+vol_h+8}" class="d0band"/>')
     if signal_idx is not None: out.append(f'<line x1="{xs[signal_idx]:.1f}" x2="{xs[signal_idx]:.1f}" y1="{top}" y2="{vol_top+vol_h}" class="sigline"/>')
+    if has_markers:
+        for marker in price_markers:
+            marker_idx=locate(marker["date"])
+            if marker_idx is not None:
+                x=xs[marker_idx]
+                color="#c02756" if marker["side"]=="buy" else "#1766bd"
+                label_bottom=subtitle_last_y+(28 if marker["side"]=="buy" else 50)
+                out.append(f'<line x1="{x:.1f}" x2="{x:.1f}" y1="{label_bottom}" y2="{py(marker["price"]):.1f}" stroke="{color}" stroke-width="1" stroke-dasharray="3 3" opacity=".8"/>')
     for col,color in (("ma5","#f39c12"),("ma10","#8e44ad"),("ma20","#2980b9")):
         if col not in bars:continue
         pts=" ".join(f"{xs[i]:.1f},{py(v):.1f}" for i,v in enumerate(bars[col].values) if np.isfinite(v)); out.append(f'<polyline points="{pts}" fill="none" stroke="{color}" stroke-width="1.2"/>')
@@ -104,6 +142,20 @@ def render_chart(bars,title,subtitle="",target_date=None,signal_date=None,period
     if period == "D" and "board_type" in bars and bars.board_type.astype(str).isin(["limit_up", "one_word_up", "limit_down", "one_word_down"]).any():
         for lx,color,label in ((left,"#ff1493","涨停"),(left+62,"#00a6a6","跌停"),(left+124,"#8b0000","一字涨停"),(left+204,"#006400","一字跌停")):
             out.append(f'<rect x="{lx:.1f}" y="{top-18:.1f}" width="9" height="9" fill="{color}"/><text x="{lx+12:.1f}" y="{top-10:.1f}" class="axis">{label}</text>')
+    if has_markers:
+        for marker in price_markers or ():
+            marker_idx = locate(marker["date"])
+            if marker_idx is None:
+                continue
+            x = xs[marker_idx]
+            buy = marker["side"] == "buy"
+            color = "#c02756" if buy else "#1766bd"
+            label = f'{"B" if buy else "S"} {marker["price"]:.2f}'
+            label_width = len(label) * 7 + 14
+            label_x = min(max(x - label_width / 2, 4), width - 4 - label_width)
+            label_y = subtitle_last_y + (10 if buy else 32)
+            description = f'{"买入" if buy else "卖出"}收盘 {marker["price"]:.2f} {pd.Timestamp(marker["date"]):%Y-%m-%d}'
+            out.append(f'<g class="trade-marker {"buy-marker" if buy else "sell-marker"}" aria-label="{esc(description)}"><rect x="{label_x:.1f}" y="{label_y:.1f}" width="{label_width:.1f}" height="18" rx="3" fill="{color}"/><text x="{label_x+7:.1f}" y="{label_y+13:.1f}" fill="#fff" font-size="11">{esc(label)}</text></g>')
     label_y=height-8
     if target_idx is not None:
         target_label = {"D": "D0一字", "W": "D0所在周", "M": "D0所在月"}[period]

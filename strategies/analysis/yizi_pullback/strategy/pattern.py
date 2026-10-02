@@ -7,9 +7,9 @@ Pattern bars:
   4. Exclude suspected ST one-price boards (main-board 5% limit-up proxy)
   5. D0 adjusted price must not exceed 1.2x the minimum adjusted low over the prior 63 valid stock bars
 
-Outputs: occurrence counts, forward-return stats (D2+1..D2+20, entry at D2 close / D3 open),
-signal+20 return distribution, plus results/yizi_pullback_d2_{events,summary}.csv
-Usage : python scripts/pattern_yizi_pullback.py [--years 10]
+Outputs: occurrence counts, D1-D3 lowest-low bar close to best T+1..T+25 close,
+and results/events.csv plus results/summary.csv.
+Usage : python strategies/analysis/yizi_pullback/strategy/pattern.py [--years 10]
 """
 import argparse
 import os
@@ -20,7 +20,7 @@ import pandas as pd
 
 import event_study as es
 
-HORIZONS = (1, 3, 5, 10, 20)
+HORIZONS = (1, 3, 5, 10)
 YIZI_TOLERANCE_CENTS = 1
 DROP_BINS = [-np.inf, -0.07, -0.03, 0]
 DROP_LABELS = ["暴力(<-7%)", "中等(-7%~-3%)", "温和(-3%~0)"]
@@ -99,7 +99,7 @@ def find_events(df, start):
     )
     ev["year"] = pd.DatetimeIndex(ev.signal_date).year
     n_first_yizi = int((d0 & (df.date >= pd.Timestamp(start))).sum())
-    return ev, t, n_first_yizi
+    return ev, t, k, n_first_yizi
 
 
 def fmt_pct(x):
@@ -128,14 +128,29 @@ def main():
     start = end - pd.DateOffset(years=args.years)
     df = es.load_bars(start)
 
-    ev, t, n_first_yizi = find_events(df, start)
+    ev, t, d0_pos, n_first_yizi = find_events(df, start)
     fr = es.forward_returns(df, t, HORIZONS)
-    ev = pd.concat([ev, fr], axis=1)
+    path = es.d3_low_bar_close_to_t25_best_close(df, d0_pos, t)
+    # Keep ordinary close/open forward returns under their original names.
+    # The D1-D3 low-bar close and retrospective best T+25 close remain
+    # separate from the older signal-day close / next-open reference returns.
+    market = es.market_index(df).close_idx.reindex(df.date).values
+    start_pos = path["return_start_pos"].to_numpy()
+    end_pos = path["return_end_pos"].to_numpy()
+    start_safe = np.maximum(start_pos, 0)
+    end_safe = np.maximum(end_pos, 0)
+    market_path = np.where(
+        (start_pos >= 0) & (end_pos >= 0),
+        market[end_safe] / market[start_safe] - 1,
+        np.nan,
+    )
+    path["ex_close_to_best_close_25"] = path["ret_close_to_best_close_25"] - market_path
+    ev = pd.concat([ev, fr, path], axis=1)
     # The source data has no formal ST flag.  st_like is the documented proxy:
     # a main-board one-price 5% limit-up that is not also the normal 10% limit.
     n_before_st = len(ev)
     ev = ev[~ev.st_like].reset_index(drop=True)
-    tag = "yizi_pullback_d2"
+    tag = "yizi_pullback"
 
     # ---- occurrence counts
     print(f"区间: {start.date()} ~ {end.date()}")
@@ -143,7 +158,7 @@ def main():
           f"  -> 去除疑似ST: {n_before_st:,} -> {len(ev):,} 次"
           f"  ->  D2收盘低于一字板价: {len(ev):,} 次, 涉及 {ev.ts_code.nunique():,} 只股票")
     print(f"其中次日一字涨停无法开盘买入: {int(ev.entry_blocked.sum())} 次 ({ev.entry_blocked.mean():.1%})，"
-          f"t+20 数据不足: {int(ev.ret_close_20.isna().sum())} 次")
+          f"买入后t+25 数据不足: {int(ev.ret_close_to_best_close_25.isna().sum())} 次")
     for col, name in [("year", "年份"), ("drop_bucket", "信号日相对一字板回调力度"),
                       ("gap_bars", "首次跌破发生在D1/D2"),
                       ("d1_direction", "D1方向"), ("d1_limit_up", "D1是否涨停"),
@@ -158,23 +173,27 @@ def main():
     for col in ["drop_bucket", "gap_bars", "d1_direction", "d1_limit_up", "board", "st_like", "year"]:
         s = es.summarize(ev, col, HORIZONS)
         parts.append(s)
-        print_stats(s[s.horizon == 20], f"按 {col} 分组, t+20")
+        print_stats(s[s.horizon == max(HORIZONS)], f"按 {col} 分组, 最长参考期")
 
-    # ---- t+20 distribution
-    d = pd.concat({"close买入": es.distribution(ev.ret_close_20),
-                   "open买入": es.distribution(ev.ret_open_20[~ev.entry_blocked])}, axis=1)
-    for c in d.columns:
-        if c[1] != "count":
-            d[c] = d[c].map(lambda v: f"{v:.1%}")
-    print("\n== t+20 收益分布 ==")
-    print(d.to_string())
+    path_summary = es._stats(ev.ret_close_to_best_close_25, ev.ex_close_to_best_close_25)
+    print("\n== D1-D3最低价K线收盘买入 -> 买入后T+1至T+25最高收盘卖出（事后最优） ==")
+    print("  " + ", ".join([
+        f"样本={path_summary['n']}", f"均值={fmt_pct(path_summary['mean'])}",
+        f"中位数={fmt_pct(path_summary['median'])}", f"P10={fmt_pct(path_summary['p10'])}",
+        f"P90={fmt_pct(path_summary['p90'])}", f"平均超额={fmt_pct(path_summary['ex_mean'])}",
+    ]))
+    parts.append(pd.DataFrame([{
+        "group_by": "全部", "group": "全部", "entry": "d1_d3_low_bar_close_to_best_close",
+        "horizon": 25, **path_summary,
+    }]))
 
+    # ---- write final results
     os.makedirs(es.RESULTS, exist_ok=True)
-    ev.to_csv(os.path.join(es.RESULTS, f"{tag}_events.csv"), index=False,
+    ev.to_csv(os.path.join(es.RESULTS, "events.csv"), index=False,
               encoding="utf-8-sig", float_format="%.4f")
-    pd.concat(parts).to_csv(os.path.join(es.RESULTS, f"{tag}_summary.csv"), index=False,
+    pd.concat(parts).to_csv(os.path.join(es.RESULTS, "summary.csv"), index=False,
                             encoding="utf-8-sig", float_format="%.4f")
-    print(f"\n明细 -> results/{tag}_events.csv, 统计 -> results/{tag}_summary.csv")
+    print("\n明细 -> results/events.csv, 统计 -> results/summary.csv")
 
 
 if __name__ == "__main__":

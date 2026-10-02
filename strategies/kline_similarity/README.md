@@ -39,7 +39,7 @@ python -m strategies.kline_similarity.visualize `
 python -m strategies.kline_similarity.benchmark 601567.SH 2026-09-14 2026-09-29 --timeframe 1d
 ```
 
-引擎已按 `kline_similarity_optimization_core.md` 做了首轮优化：非法窗口在 local Top-N 前屏蔽；Stage 1 只保留 metadata 并限制全局召回数量；DTW 使用 Sakoe-Chiba rolling-row 低内存实现；NMS 按 bar 区间重叠率判断。基准机上 5908 只股票、recall 1000 的日线示例从约 92~101 秒降至约 63 秒，三周期 Top10 纯渲染约 1 秒。
+引擎已按 `kline_similarity_optimization_core.md` 做了首轮优化：非法窗口在 local Top-N 前屏蔽；Stage 1 只保留 metadata 并限制全局召回数量；DTW 使用 Sakoe-Chiba rolling-row 低内存实现；NMS 按 bar 区间重叠率判断。基准机上 5908 只股票、recall 1000 的日线示例从约 92~101 秒降至约 63 秒，三周期 Top20 纯渲染约 1 秒。
 
 ## 本地 UI 小软件
 
@@ -49,7 +49,7 @@ python -m strategies.kline_similarity.benchmark 601567.SH 2026-09-14 2026-09-29 
 python -m strategies.kline_similarity.app
 ```
 
-浏览器打开 `http://127.0.0.1:8765`。UI 支持股票名称/代码联想（日常名称来自 TDX 的 `infoharbor_ex.code`）、日/周/月周期、日期区间、Top10 三周期图表和过往查询记录。搜索在后台线程执行，页面会显示进度状态；历史记录保存在 `strategies/kline_similarity/query_history.json`。
+浏览器打开 `http://127.0.0.1:8765`。UI 支持股票名称/代码联想（日常名称来自 TDX 的 `infoharbor_ex.code`）、日/周/月周期、日期区间、Top20 三周期图表和过往查询记录。搜索在后台线程执行，页面会显示进度状态；历史记录保存在 `strategies/kline_similarity/query_history.json`。
 
 Windows 用户可以直接双击 `start_ui.bat`：它会在后台启动服务并自动打开浏览器，不需要手动输入命令或网址。
 

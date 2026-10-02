@@ -16,7 +16,7 @@ def main() -> None:
     parser.add_argument("end")
     parser.add_argument("--timeframe", "--period", default="1d", choices=("1d", "1w", "1m"))
     parser.add_argument("--data", default="database/processed/stock_daily_qfq.parquet")
-    parser.add_argument("--top-k", type=int, default=50)
+    parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--recall-n", type=int, default=1000)
     parser.add_argument("--include-future", action="store_true", help="allow candidates ending on/after query start")
     parser.add_argument("--no-volume", action="store_true")

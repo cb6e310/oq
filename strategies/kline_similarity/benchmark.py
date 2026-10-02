@@ -23,10 +23,10 @@ def main() -> None:
     start = time.perf_counter()
     provider = ParquetDataProvider(args.data)
     load_s = time.perf_counter() - start
-    engine = KlineSimilarityEngine(provider, SimilarityConfig(recall_n=args.recall_n, top_k=10))
+    engine = KlineSimilarityEngine(provider, SimilarityConfig(recall_n=args.recall_n, top_k=20))
     start = time.perf_counter()
     result = engine.search(args.symbol, args.start, args.end, timeframe=args.timeframe,
-                           top_k=10, history_only=True, recall_n=args.recall_n)
+                           top_k=20, history_only=True, recall_n=args.recall_n)
     search_s = time.perf_counter() - start
     print(json.dumps({
         "symbol": args.symbol, "start": args.start, "end": args.end,

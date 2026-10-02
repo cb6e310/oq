@@ -97,7 +97,7 @@ def build_visual_results(
     *,
     timeframe: str = "1d",
     output_dir: str | Path = "strategies/kline_similarity/results",
-    top_k: int = 10,
+    top_k: int = 20,
     history_only: bool = True,
 ) -> list[dict]:
     """Search and render a standardized result list.
@@ -202,10 +202,10 @@ def main() -> None:
     parser.add_argument("--recall-n", type=int, default=1000)
     parser.add_argument("--include-future", action="store_true")
     args = parser.parse_args()
-    engine = KlineSimilarityEngine(ParquetDataProvider(args.data), SimilarityConfig(recall_n=args.recall_n, top_k=10))
+    engine = KlineSimilarityEngine(ParquetDataProvider(args.data), SimilarityConfig(recall_n=args.recall_n, top_k=20))
     result = build_visual_results(engine, args.symbol, args.start, args.end,
                                   timeframe=args.timeframe, output_dir=args.output_dir,
-                                  top_k=10, history_only=not args.include_future)
+                                  top_k=20, history_only=not args.include_future)
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
