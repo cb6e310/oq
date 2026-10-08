@@ -11,6 +11,9 @@ import numpy as np
 import pandas as pd
 
 DAY_DTYPE = np.dtype([("date","<u4"),("open","<u4"),("high","<u4"),("low","<u4"),("close","<u4"),("amount","<f4"),("vol","<u4"),("reserved","<u4")])
+BOARD_COLORS = {"limit_up":"#f000a8", "one_word_up":"#8900ff",
+                "gap_limit_up":"#d81b60", "t_board_up":"#ff6f00",
+                "limit_down":"#008cff", "one_word_down":"#003bbb"}
 
 def esc(value): return html.escape(str(value), quote=True)
 
@@ -18,11 +21,47 @@ def read_tdx_day(path):
     raw=np.fromfile(Path(path),dtype=DAY_DTYPE)
     return pd.DataFrame({"date":pd.to_datetime(raw["date"].astype(str),format="%Y%m%d"),"open":raw["open"]/100.0,"high":raw["high"]/100.0,"low":raw["low"]/100.0,"close":raw["close"]/100.0,"vol":raw["vol"].astype(np.int64)})
 
+def daily_board_types(daily):
+    """Label close-at-limit days using ex-right reference prices and board limits."""
+    if "board_type" in daily:
+        return daily.board_type
+    labels = pd.Series("", index=daily.index, dtype="object")
+    if "ts_code" not in daily or len(daily) < 2:
+        return labels
+    code = daily.ts_code.astype(str)
+    previous = daily.groupby("ts_code", observed=True).close.shift()
+    reference = previous
+    if "adj_factor" in daily:
+        previous_factor = daily.groupby("ts_code", observed=True).adj_factor.shift()
+        reference = previous * previous_factor / daily.adj_factor
+    prefix = code.str[:2]
+    main = prefix.isin(["60", "00"])
+    chinext = prefix.eq("30")
+    limit_pct = np.select(
+        [main, chinext & daily.date.lt(pd.Timestamp("2020-08-24")),
+         chinext | prefix.eq("68"), prefix.eq("92")],
+        [.10, .10, .20, .30], default=np.nan)
+    close_cents = np.rint(daily.close * 100)
+    up_cents = np.floor(reference * (1 + limit_pct) * 100 + .5 + 1e-6)
+    down_cents = np.floor(reference * (1 - limit_pct) * 100 + .5 + 1e-6)
+    up_five = np.floor(reference * 1.05 * 100 + .5 + 1e-6)
+    down_five = np.floor(reference * .95 * 100 + .5 + 1e-6)
+    up = close_cents.eq(up_cents) | (main & close_cents.eq(up_five))
+    down = close_cents.eq(down_cents) | (main & close_cents.eq(down_five))
+    one_word = daily.open.eq(daily.high) & daily.high.eq(daily.low) & daily.low.eq(daily.close)
+    labels.loc[up] = "limit_up"
+    labels.loc[down] = "limit_down"
+    labels.loc[up & one_word] = "one_word_up"
+    labels.loc[down & one_word] = "one_word_down"
+    return labels
+
 def aggregate_bars(daily, period="D"):
     """聚合日线；周线按周五周期，月线按自然月，并重新计算 MA5/10/20。"""
     x=daily.sort_values("date").copy()
     if period=="D":
         out=x[["date","open","high","low","close","vol"]].copy(); out["period_key"]=out.date.dt.strftime("%Y-%m-%d")
+        if "ts_code" in x or "board_type" in x:
+            out["board_type"] = daily_board_types(x)
     else:
         freq="W-FRI" if period=="W" else "ME"; key_freq="W-FRI" if period=="W" else "M"
         out=(x.set_index("date").resample(freq).agg(open=("open","first"),high=("high","max"),low=("low","min"),close=("close","last"),vol=("vol","sum")).dropna(subset=["open","close"]).reset_index())
@@ -133,14 +172,13 @@ def render_chart(bars,title,subtitle="",target_date=None,signal_date=None,period
     for i,r in bars.iterrows():
         x=xs[i]
         board_type = str(r.get("board_type", "")) if period == "D" else ""
-        board_colors = {"limit_up":"#ff1493", "one_word_up":"#8b0000",
-                        "limit_down":"#00a6a6", "one_word_down":"#006400"}
-        color=board_colors.get(board_type, "#e74c3c" if r.close>=r.open else "#16a085")
+        color=BOARD_COLORS.get(board_type, "#e74c3c" if r.close>=r.open else "#16a085")
         out.append(f'<line x1="{x:.1f}" x2="{x:.1f}" y1="{py(r.high):.1f}" y2="{py(r.low):.1f}" stroke="{color}" stroke-width="1"/>'); y0,y1=py(max(r.open,r.close)),py(min(r.open,r.close)); out.append(f'<rect x="{x-xstep*.31:.1f}" y="{y0:.1f}" width="{max(xstep*.62,1):.1f}" height="{max(y1-y0,1):.1f}" fill="{color}"/>')
         if show_volume: out.append(f'<rect x="{x-xstep*.31:.1f}" y="{vy(r.vol):.1f}" width="{max(xstep*.62,1):.1f}" height="{max(vol_top+vol_h-vy(r.vol),1):.1f}" fill="{color}" opacity=".45"/>')
     if show_volume:out.append(f'<line x1="{left}" x2="{width-right}" y1="{vol_top}" y2="{vol_top}" class="volline"/>')
-    if period == "D" and "board_type" in bars and bars.board_type.astype(str).isin(["limit_up", "one_word_up", "limit_down", "one_word_down"]).any():
-        for lx,color,label in ((left,"#ff1493","涨停"),(left+62,"#00a6a6","跌停"),(left+124,"#8b0000","一字涨停"),(left+204,"#006400","一字跌停")):
+    if period == "D" and "board_type" in bars and bars.board_type.astype(str).isin(BOARD_COLORS).any():
+        for lx,kind,label in ((left,"limit_up","涨停"),(left+62,"gap_limit_up","高开涨停"),(left+154,"t_board_up","T字板"),(left+224,"one_word_up","一字涨停"),(left+316,"limit_down","跌停"),(left+378,"one_word_down","一字跌停")):
+            color = BOARD_COLORS[kind]
             out.append(f'<rect x="{lx:.1f}" y="{top-18:.1f}" width="9" height="9" fill="{color}"/><text x="{lx+12:.1f}" y="{top-10:.1f}" class="axis">{label}</text>')
     if has_markers:
         for marker in price_markers or ():
