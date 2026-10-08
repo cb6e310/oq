@@ -7,7 +7,13 @@ import pandas as pd
 
 from strategies.kline_similarity import KlineSimilarityEngine, SimilarityConfig, aggregate_bars, build_visual_results
 from strategies.kline_similarity.engine import _event_features, _rank, _structure_distances
-from strategies.kline_similarity.engine import _bounded_candidates, _constrained_dtw, _global_nms, SimilarityMatch
+from strategies.kline_similarity.engine import _special_event_match, _prioritize_special_events
+from strategies.kline_similarity.engine import _bounded_candidates, _candidate_lengths, _constrained_dtw
+from strategies.kline_similarity.engine import _elastic_dtw, _global_nms, SimilarityMatch
+from strategies.kline_similarity.engine import (
+    _coarse_event_distance, _coarse_shape_distance, _coarse_state_distance,
+    _coarse_structure_distance, _elastic_coarse_distances, _state_features,
+)
 
 
 def _bars(phase=0.0, n=180):
@@ -31,6 +37,24 @@ class Provider:
 
 
 class EngineTests(unittest.TestCase):
+    def test_batched_elastic_recall_matches_scalar_distances(self):
+        frame = _bars(n=70)
+        query = frame.iloc[20:31].reset_index(drop=True)
+        query_states, _ = _state_features(query)
+        frame_states, _ = _state_features(frame)
+        query_events, frame_events = _event_features(query), _event_features(frame)
+        for length in (8, 11, 15):
+            expected = (
+                _coarse_shape_distance(query, frame, length),
+                _coarse_structure_distance(query, frame, length),
+                _coarse_state_distance(query_states, frame_states, length),
+                _coarse_event_distance(query_events, frame_events, length),
+            )
+            actual = _elastic_coarse_distances(query, frame, query_states, frame_states,
+                                               query_events, frame_events, length, True)
+            for fast, slow in zip(actual, expected):
+                np.testing.assert_allclose(fast, slow, rtol=1e-10, atol=1e-10)
+
     def test_aggregate_week_and_month(self):
         data = _bars(n=70)
         weekly = aggregate_bars(data, "1w")
@@ -79,6 +103,28 @@ class EngineTests(unittest.TestCase):
             self.assertIn("weekly", html)
             self.assertIn("<svg", html)
 
+    def test_elastic_visual_results_expose_length_metadata_and_diagnostics(self):
+        engine = KlineSimilarityEngine(
+            Provider(), SimilarityConfig(length_mode="elastic", local_top_n=2, recall_n=10, top_k=2,
+                                         min_window_length=8, max_window_length=40)
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            result = build_visual_results(
+                engine, "A", "2020-04-01", "2020-04-30", timeframe="1d",
+                output_dir=tmp, top_k=2, history_only=False, match_mode="elastic",
+                return_diagnostics=True,
+            )
+            self.assertTrue(result)
+            self.assertTrue(all(item["match_mode"] == "elastic" for item in result))
+            self.assertTrue(all(item["window_length"] > 0 for item in result))
+            self.assertTrue(all("search_diagnostics" in item for item in result))
+            self.assertIn("length_grid", result[0]["search_diagnostics"])
+            html = Path(result[0]["html_path"]).read_text(encoding="utf-8")
+            self.assertIn("匹配模式：elastic", html)
+            self.assertIn("模式 elastic", html)
+            svg = Path(result[0]["image_paths"]["daily"]).read_text(encoding="utf-8")
+            self.assertIn("模式 elastic", svg)
+
     def test_board_events_are_explicit_features(self):
         frame = pd.DataFrame({
             "date": pd.date_range("2026-01-01", periods=4),
@@ -87,7 +133,7 @@ class EngineTests(unittest.TestCase):
             "vol": [1, 1, 1, 1],
         })
         events = _event_features(frame, "600000.SH")
-        self.assertEqual(events.shape, (4, 4))
+        self.assertEqual(events.shape, (4, 6))
         self.assertEqual(events[1, 0], 1.0)
         self.assertEqual(events[1, 2], 1.0)
 
@@ -97,6 +143,76 @@ class EngineTests(unittest.TestCase):
         ordinary.loc[1, ["open", "high", "low", "close"]] = [10.2, 10.9, 10.1, 10.9]
         ordinary_events = _event_features(ordinary, "600000.SH")
         self.assertEqual(ordinary_events[1, 0], 0.0)
+        ordinary.loc[1, ["open", "high", "low", "close"]] = [10.2, 11.5, 10.1, 11.5]
+        self.assertEqual(_event_features(ordinary, "600000.SH")[1, 0], 0.0)
+
+    def test_t_board_and_one_word_up_are_distinct_special_events(self):
+        frame = pd.DataFrame({
+            "date": pd.date_range("2026-01-01", periods=4),
+            "open": [10.0, 11.0, 10.5, 11.55],
+            "high": [10.0, 11.0, 10.5, 11.55],
+            "low": [10.0, 10.5, 10.5, 11.55],
+            "close": [10.0, 11.0, 10.5, 11.55],
+            "vol": [100, 120, 110, 130],
+        })
+        events = _event_features(frame, "600000.SH")
+        self.assertEqual(events[1, 0], 1.0)
+        self.assertEqual(events[1, 4], 1.0)
+        self.assertEqual(events[1, 5], 1.0)
+        self.assertEqual(events[1, 2], 0.0)
+        self.assertEqual(events[3, 2], 1.0)
+        self.assertEqual(events[3, 4], 1.0)
+        self.assertEqual(events[3, 5], 0.0)
+
+        query = events[1:2]
+        exact_match, exact_missing = _special_event_match(query, events[1:2])
+        ordinary_match, ordinary_missing = _special_event_match(query, events[3:4])
+        self.assertEqual((exact_match, exact_missing), (1.0, 0))
+        self.assertLess(ordinary_match, exact_match)
+        self.assertGreater(ordinary_missing, 0)
+
+        common = dict(symbol="600000.SH", start_date=frame.date.iloc[0],
+                      end_date=frame.date.iloc[1], mass_distance=0.0,
+                      dtw_distance=0.0, aligned_distance=0.0,
+                      total_return_diff=0.0, volatility_diff=0.0)
+        t_board = SimilarityMatch(score=0.6, special_event_match=exact_match,
+                                  missing_special_events=exact_missing, **common)
+        ordinary = SimilarityMatch(score=0.9, special_event_match=ordinary_match,
+                                   missing_special_events=ordinary_missing, **common)
+        _prioritize_special_events([t_board, ordinary], query)
+        self.assertGreater(t_board.score, ordinary.score)
+
+    def test_elastic_search_prefers_t_board_candidate(self):
+        class BoardProvider:
+            def __init__(self):
+                self.data = {}
+                for symbol in ("600001.SH", "600002.SH", "600003.SH"):
+                    frame = _bars(n=75)
+                    frame.loc[:, ["open", "high", "low", "close"]] = 10.0
+                    self.data[symbol] = frame
+                for symbol, index, low in (("600001.SH", 55, 10.5),
+                                           ("600002.SH", 20, 10.5),
+                                           ("600003.SH", 20, 10.8)):
+                    self.data[symbol].loc[index, ["open", "high", "low", "close"]] = [11.0, 11.0, low, 11.0]
+
+            def get_symbols(self):
+                return list(self.data)
+
+            def get_symbol_data(self, symbol):
+                return self.data[symbol].copy()
+
+        provider = BoardProvider()
+        engine = KlineSimilarityEngine(provider, SimilarityConfig(
+            recall_n=30, local_top_n=5, top_k=3, elastic_coarse_step=1,
+            min_window_length=8, max_window_length=20,
+        ))
+        query_start = provider.data["600001.SH"].date.iloc[53]
+        query_end = provider.data["600001.SH"].date.iloc[60]
+        results = engine.search("600001.SH", query_start, query_end,
+                                match_mode="elastic", history_only=True)
+        self.assertTrue(results)
+        self.assertEqual(results[0].symbol, "600002.SH")
+        self.assertEqual(results[0].missing_special_events, 0)
 
     def test_event_queries_are_still_sorted_by_displayed_score(self):
         # A query containing a one-word limit-up bar used to activate an
@@ -134,6 +250,17 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(len(selected), 9)
         self.assertGreaterEqual(sum("structure" in x["recall_paths"] for x in selected), 3)
 
+    def test_global_recall_reserves_matching_special_board_candidates(self):
+        ordinary = [{"mass_distance": i / 1000, "event_distance": 0.0,
+                     "special_event_match": 0.0, "missing_special_events": 1,
+                     "recall_paths": "mass"} for i in range(20)]
+        matching = [{"mass_distance": 0.8 + i / 1000, "event_distance": 0.0,
+                     "special_event_match": 1.0, "missing_special_events": 0,
+                     "recall_paths": "event"} for i in range(4)]
+        selected = _bounded_candidates(ordinary + matching, 8, 0.75, special_required=True)
+        self.assertEqual(len(selected), 8)
+        self.assertGreaterEqual(sum(x["missing_special_events"] == 0 for x in selected), 4)
+
     def test_search_records_recall_statistics(self):
         engine = KlineSimilarityEngine(
             Provider(), SimilarityConfig(local_top_n=3, recall_n=10, top_k=3)
@@ -156,6 +283,86 @@ class EngineTests(unittest.TestCase):
         items = [SimilarityMatch("A", pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-10"), start_idx=0, end_idx=9, **base),
                  SimilarityMatch("A", pd.Timestamp("2020-01-05"), pd.Timestamp("2020-01-14"), start_idx=4, end_idx=13, **base)]
         self.assertEqual(len(_global_nms(items, 2, overlap_threshold=0.25)), 1)
+
+    def test_elastic_length_grid_and_dtw_support_one_bar_insert_delete(self):
+        config = SimilarityConfig(length_mode="elastic", min_window_length=3, max_window_length=40)
+        lengths = _candidate_lengths(10, config)
+        self.assertIn(10, lengths)
+        self.assertIn(8, lengths)
+        self.assertIn(12, lengths)
+        base = np.arange(10, dtype=float)[:, None]
+        inserted = np.arange(11, dtype=float)[:, None]
+        distance, path_length, skipped_query, skipped_candidate = _elastic_dtw(
+            base, inserted, np.zeros(10), np.zeros(11), 0.25, 2, 0.1, 2.5
+        )
+        self.assertTrue(np.isfinite(distance))
+        self.assertEqual(path_length, 11)
+        self.assertEqual(skipped_query, 0)
+        self.assertEqual(skipped_candidate, 1)
+
+    def test_elastic_search_returns_length_and_diagnostic_fields(self):
+        engine = KlineSimilarityEngine(
+            Provider(), SimilarityConfig(length_mode="elastic", local_top_n=2, recall_n=12, top_k=4,
+                                         min_window_length=8, max_window_length=40)
+        )
+        result = engine.search("A", "2020-04-01", "2020-04-30", history_only=False)
+        self.assertTrue(result)
+        self.assertTrue(all(item.match_mode == "elastic" for item in result))
+        self.assertTrue(all(item.query_length == 30 for item in result))
+        self.assertTrue(all(item.window_length >= 8 for item in result))
+        self.assertTrue(all(item.length_ratio > 0 for item in result))
+        self.assertIn("length_grid", engine.last_search_stats)
+        self.assertIn("skipped_candidate_bars_total", engine.last_search_stats)
+
+    def test_elastic_five_bar_query_with_eight_bar_candidate(self):
+        engine = KlineSimilarityEngine(
+            Provider(), SimilarityConfig(length_mode="elastic", local_top_n=2,
+                                         recall_n=8, top_k=2, min_window_length=8,
+                                         max_window_length=40)
+        )
+        result = engine.search("A", "2020-04-01", "2020-04-05",
+                               history_only=False, match_mode="elastic")
+        self.assertTrue(result)
+        self.assertTrue(all(item.query_length == 5 for item in result))
+        self.assertTrue(all(item.window_length == 8 for item in result))
+
+    def test_search_can_return_diagnostics_without_breaking_result_shape(self):
+        engine = KlineSimilarityEngine(
+            Provider(), SimilarityConfig(local_top_n=2, recall_n=8, top_k=2)
+        )
+        payload = engine.search("A", "2020-04-01", "2020-04-30", history_only=False, return_diagnostics=True)
+        self.assertIn("results", payload)
+        self.assertIn("diagnostics", payload)
+        self.assertEqual(len(payload["results"]), 2)
+
+    def test_latest_only_uses_each_stocks_terminal_window(self):
+        provider = Provider()
+        provider.data["C"] = provider.data["C"].iloc[:-20].copy()
+        engine = KlineSimilarityEngine(provider, SimilarityConfig(local_top_n=3, recall_n=20, top_k=10))
+        result = engine.search("A", "2020-04-01", "2020-04-10", latest_only=True,
+                               history_only=True, top_k=10)
+        self.assertEqual([match.symbol for match in result], ["B"])
+        self.assertEqual(result[0].start_date, provider.data["B"].date.iloc[-10])
+        self.assertEqual(result[0].end_date, provider.data["B"].date.iloc[-1])
+        self.assertEqual(engine.last_search_stats["candidate_scope"], "latest")
+
+    def test_latest_elastic_windows_all_end_at_latest_bar(self):
+        engine = KlineSimilarityEngine(Provider(), SimilarityConfig(
+            recall_n=20, top_k=10, min_window_length=8, max_window_length=20,
+        ))
+        result = engine.search("A", "2020-04-01", "2020-04-10",
+                               match_mode="elastic", latest_only=True, top_k=10)
+        self.assertTrue(result)
+        self.assertTrue(all(match.end_date == pd.Timestamp("2020-06-28") for match in result))
+        self.assertTrue(all(match.symbol != "A" for match in result))
+
+    def test_one_word_down_receives_special_event_priority(self):
+        query = np.zeros((3, 6))
+        query[1, 3] = 1.0
+        matching = query.copy()
+        ordinary = np.zeros_like(query)
+        self.assertEqual(_special_event_match(query, matching), (1.0, 0))
+        self.assertEqual(_special_event_match(query, ordinary), (0.0, 1))
 
 
 if __name__ == "__main__":

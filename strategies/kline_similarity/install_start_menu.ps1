@@ -1,7 +1,10 @@
 $ErrorActionPreference = "Stop"
 $scriptDir = $PSScriptRoot
 $repoRoot = (Resolve-Path (Join-Path $scriptDir "..\..")).Path
-$pythonw = (Get-Command pythonw.exe -ErrorAction SilentlyContinue).Source
+$pythonw = Join-Path $env:USERPROFILE ".conda\envs\stock_quant\pythonw.exe"
+if (-not (Test-Path -LiteralPath $pythonw)) {
+    $pythonw = (Get-Command pythonw.exe -ErrorAction SilentlyContinue).Source
+}
 if (-not $pythonw) {
     $python = (Get-Command python.exe -ErrorAction SilentlyContinue).Source
     if ($python) { $pythonw = Join-Path (Split-Path $python) "pythonw.exe" }

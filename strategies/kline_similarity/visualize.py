@@ -74,9 +74,13 @@ def _annotate_daily_events(bars: pd.DataFrame, symbol: str) -> pd.DataFrame:
     out = bars.copy()
     events = _event_features(out, symbol)
     labels = []
-    for up, down, one_up, one_down in events:
+    for up, down, one_up, one_down, high_open_up, t_board_up in events:
         if one_up:
             labels.append("one_word_up")
+        elif t_board_up:
+            labels.append("t_board_up")
+        elif high_open_up:
+            labels.append("gap_limit_up")
         elif one_down:
             labels.append("one_word_down")
         elif up:
@@ -99,6 +103,11 @@ def build_visual_results(
     output_dir: str | Path = "strategies/kline_similarity/results",
     top_k: int = 20,
     history_only: bool = True,
+    match_mode: str | None = None,
+    min_length: int | None = None,
+    max_length: int | None = None,
+    return_diagnostics: bool = False,
+    latest_only: bool = False,
 ) -> list[dict]:
     """Search and render a standardized result list.
 
@@ -108,8 +117,20 @@ def build_visual_results(
     the daily chart for compatibility; ``image_paths`` contains all three.
     """
     tf = _normalize_timeframe(timeframe)
-    matches = engine.search(query_symbol, start_date, end_date, timeframe=tf,
-                            top_k=top_k, history_only=history_only)
+    if latest_only and top_k == 20:
+        top_k = 10
+    search_result = engine.search(
+        query_symbol, start_date, end_date, timeframe=tf, top_k=top_k,
+        history_only=history_only, match_mode=match_mode, min_length=min_length,
+        max_length=max_length, return_diagnostics=return_diagnostics,
+        latest_only=latest_only,
+    )
+    diagnostics = dict(engine.last_search_stats)
+    if isinstance(search_result, dict):
+        matches = search_result["results"]
+        diagnostics = dict(search_result.get("diagnostics", diagnostics))
+    else:
+        matches = search_result
     aggregate_bars, mobile_css, render_chart = _chart_tools()
     out = Path(output_dir).resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -142,9 +163,17 @@ def build_visual_results(
         weekly_window = centered_period(weekly_bars, weekly_target, 22)
         monthly_window = centered_period(monthly_bars, monthly_target, 22)
         stem = f"{rank:02d}_{_safe_name(match.symbol)}_{match.start_date:%Y%m%d}_{match.end_date:%Y%m%d}_{tf}"
-        subtitle = (f"相似度 {match.score:.4f} · MASS {match.mass_distance:.4f} · "
-                    f"DTW {match.dtw_distance:.4f} · 区间 {match.start_date:%Y-%m-%d} 至 {match.end_date:%Y-%m-%d} · "
+        subtitle = (f"相似度 {match.score:.4f} · 模式 {match.match_mode} · "
+                    f"长度 {match.window_length}/{match.query_length}（{match.length_ratio:.2f}x） · "
+                    f"MASS {match.mass_distance:.4f} · DTW {match.dtw_distance:.4f} · "
+                    f"区间 {match.start_date:%Y-%m-%d} 至 {match.end_date:%Y-%m-%d} · "
                     f"特殊板事件距离 {match.event_distance:.4f}")
+        if match.special_event_required:
+            subtitle += (f" · 特殊板匹配 {match.special_event_match:.0%}"
+                         f" · 缺少 {match.missing_special_events} 根")
+        if match.match_mode == "elastic":
+            subtitle += (f" · 状态 {match.state_distance:.4f} · 锚点 {match.anchor_distance:.4f} · "
+                         f"跳过 Q/C {match.skipped_query_bars}/{match.skipped_candidate_bars}")
         daily_path = out / f"{stem}_daily.svg"
         weekly_path = out / f"{stem}_weekly.svg"
         monthly_path = out / f"{stem}_monthly.svg"
@@ -171,15 +200,18 @@ def build_visual_results(
             "start_date": item["start_date"], "end_date": item["end_date"],
         }, "image_path": str(daily_path), "image": str(daily_path), "image_paths": {
             "daily": str(daily_path), "weekly": str(weekly_path), "monthly": str(monthly_path),
-        }})
+        }, "search_diagnostics": diagnostics})
         results.append(item)
     index = out / f"similarity_{_safe_name(query_symbol)}_{tf}_top{top_k}.html"
     body = ["<!doctype html><meta charset='utf-8'><style>", mobile_css(), "</style><div class='wrap'>",
             f"<div class='head'><h1>{query_symbol} {tf} 相似 K 线 Top {len(results)}</h1>",
-            f"<p>查询区间：{query_start:%Y-%m-%d} 至 {query_end:%Y-%m-%d}｜日线前后各90根；周线、月线前后各22根</p></div>"]
+            f"<p>查询区间：{query_start:%Y-%m-%d} 至 {query_end:%Y-%m-%d}｜"
+            f"匹配模式：{(match_mode or engine.config.length_mode)}｜候选范围：{'最新走势' if latest_only else '历史区间'}｜日线前后各90根；周线、月线前后各22根</p></div>"]
     for item in results:
         body.append(f"<div class='sample'><div class='sample-head'>排名 {item['rank']} · {item['symbol']} · "
-                    f"{item['start_date']} 至 {item['end_date']} · 相似度 {item['score']:.4f}</div>")
+                    f"{item['start_date']} 至 {item['end_date']} · 相似度 {item['score']:.4f} · "
+                    f"模式 {item['match_mode']} · 窗口 {item['window_length']}/{item['query_length']} "
+                    f"({item['length_ratio']:.2f}x)</div>")
         for label in ("daily", "weekly", "monthly"):
             body.append(f"<div class='period-label'>{label}</div>")
             body.append(Path(item["image_paths"][label]).read_text(encoding="utf-8"))
@@ -201,11 +233,21 @@ def main() -> None:
     parser.add_argument("--output-dir", default="strategies/kline_similarity/results")
     parser.add_argument("--recall-n", type=int, default=1000)
     parser.add_argument("--include-future", action="store_true")
+    parser.add_argument("--latest-only", action="store_true", help="compare each stock's latest window only")
+    parser.add_argument("--match-mode", choices=("fixed", "elastic"), default="fixed")
+    parser.add_argument("--min-length", type=int, default=None)
+    parser.add_argument("--max-length", type=int, default=None)
     args = parser.parse_args()
-    engine = KlineSimilarityEngine(ParquetDataProvider(args.data), SimilarityConfig(recall_n=args.recall_n, top_k=20))
+    engine = KlineSimilarityEngine(
+        ParquetDataProvider(args.data),
+        SimilarityConfig(recall_n=args.recall_n, top_k=20, length_mode=args.match_mode),
+    )
     result = build_visual_results(engine, args.symbol, args.start, args.end,
                                   timeframe=args.timeframe, output_dir=args.output_dir,
-                                  top_k=20, history_only=not args.include_future)
+                                  top_k=10 if args.latest_only else 20, history_only=not args.include_future,
+                                  match_mode=args.match_mode, min_length=args.min_length,
+                                  max_length=args.max_length, return_diagnostics=True,
+                                  latest_only=args.latest_only)
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
