@@ -13,10 +13,14 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Iterable, Mapping, Protocol
 import heapq
+from time import perf_counter
 import numpy as np
 import pandas as pd
 
 from .elastic_fast import coarse_distances as _compiled_coarse_distances
+from .elastic_fast import state_edit_distance as _compiled_state_edit_distance
+from .elastic_fast import elastic_dtw as _compiled_elastic_dtw
+from .elastic_fast import fixed_dtw as _compiled_fixed_dtw
 
 
 PRICE_COLUMNS = ("open", "high", "low", "close")
@@ -28,6 +32,7 @@ EVENT_NAMES = ("limit_up", "limit_down", "one_word_up", "one_word_down",
                "gap_limit_up", "t_board_up")
 SPECIAL_EVENT_CHANNELS = (2, 3, 4, 5)
 SPECIAL_EVENT_WEIGHTS = np.array((3.0, 3.0, 1.0, 4.0))
+EVENT_PRIORITY_WEIGHTS = np.array((1.0, 1.0, 3.0, 3.0, 1.0, 4.0))
 DEFAULT_FEATURE_WEIGHTS = np.array([2.0, 0.8, 1.2, 0.8, 0.8, 1.0, 0.6], dtype=float)
 
 
@@ -94,11 +99,21 @@ class ParquetDataProvider:
             raise FileNotFoundError(self.path)
         frame = pd.read_parquet(self.path)
         frame["date"] = pd.to_datetime(frame["date"])
+        prices = frame[list(PRICE_COLUMNS)].to_numpy(dtype=float, na_value=np.nan)
+        valid_prices = np.isfinite(prices).all(axis=1) & (prices > 0).all(axis=1)
+        self._daily_search_ready = (
+            {"vol", "amount"}.issubset(frame.columns)
+            and frame["date"].notna().all()
+            and not frame.duplicated(["ts_code", "date"]).any()
+            and valid_prices.all()
+        )
         self._data = {
             str(symbol): group.sort_values("date").reset_index(drop=True)
             for symbol, group in frame.groupby("ts_code", sort=False, observed=True)
         }
         self._bars_cache: dict[str, dict[str, pd.DataFrame]] = {}
+        self._valid_bars_cache: dict[str, dict[str, pd.DataFrame]] = {}
+        self._latest_date = frame.loc[valid_prices, "date"].max()
 
     def get_symbols(self) -> list[str]:
         return list(self._data)
@@ -116,6 +131,29 @@ class ParquetDataProvider:
         if str(symbol) not in cache:
             cache[str(symbol)] = aggregate_bars(self.get_symbol_data(symbol), timeframe)
         return cache[str(symbol)].copy()
+
+    def get_search_bars(self, symbol: str, timeframe: str) -> pd.DataFrame:
+        """Return cached, validated bars for read-only engine searches."""
+        timeframe = _normalize_timeframe(timeframe)
+        if timeframe == "1d" and self._daily_search_ready:
+            return self._data[str(symbol)]
+        cache = self._valid_bars_cache.setdefault(timeframe, {})
+        symbol = str(symbol)
+        if symbol not in cache:
+            cache[symbol] = _valid_bars(aggregate_bars(self._data[symbol], timeframe))
+        return cache[symbol]
+
+    def get_latest_date(self, timeframe: str) -> pd.Timestamp:
+        """Latest aggregate label without materializing every stock's bars."""
+        timeframe = _normalize_timeframe(timeframe)
+        if not self._daily_search_ready:
+            return max((self.get_search_bars(symbol, timeframe).date.max()
+                        for symbol in self.get_symbols()), default=pd.NaT)
+        if timeframe == "1w":
+            return self._latest_date.to_period("W-FRI").end_time.normalize()
+        if timeframe == "1m":
+            return self._latest_date.to_period("M").end_time.normalize()
+        return self._latest_date
 
 
 @dataclass(frozen=True)
@@ -146,6 +184,8 @@ class SimilarityConfig:
     special_event_weight: float = 0.20
     event_recall_weight: float = 0.75
     hard_event_match: bool = True
+    weekly_context_weight: float = 0.25
+    weekly_context_bars: int = 8
     use_volume: bool = True
     feature_weights: tuple[float, ...] = tuple(DEFAULT_FEATURE_WEIGHTS.tolist())
 
@@ -165,6 +205,9 @@ class SimilarityMatch:
     special_event_match: float = 0.0
     missing_special_events: int = 0
     special_event_required: bool = False
+    base_score: float = 0.0
+    event_count_distance: float = 0.0
+    event_order_distance: float = 0.0
     mass_rank: float = 0.0
     dtw_rank: float = 0.0
     aligned_rank: float = 0.0
@@ -184,9 +227,22 @@ class SimilarityMatch:
     warp_path_length: int = 0
     skipped_query_bars: int = 0
     skipped_candidate_bars: int = 0
+    daily_score: float = 0.0
+    weekly_context_active: bool = False
+    weekly_context_distance: float = 0.0
+    weekly_context_score: float = 0.0
+    weekly_context_coverage: float = 0.0
+    weekly_context_pre_bars: int = 0
+    weekly_context_interval_bars: int = 0
+    weekly_context_weight_used: float = 0.0
 
     def to_dict(self) -> dict:
         result = asdict(self)
+        # Keep legacy special_event_* fields readable in saved histories while
+        # exposing the broader policy under event_* names for new clients.
+        result.update(event_required=self.special_event_required,
+                      event_match=self.special_event_match,
+                      missing_events=self.missing_special_events)
         for key in ("start_date", "end_date"):
             result[key] = pd.Timestamp(result[key]).strftime("%Y-%m-%d")
         return result
@@ -200,6 +256,10 @@ class KlineSimilarityEngine:
         self.config = config or SimilarityConfig()
         if len(self.config.feature_weights) != len(FEATURE_NAMES):
             raise ValueError("feature_weights must contain seven values")
+        if not 0 <= self.config.weekly_context_weight <= 1:
+            raise ValueError("weekly_context_weight must be between zero and one")
+        if self.config.weekly_context_bars < 0:
+            raise ValueError("weekly_context_bars must be nonnegative")
         self.last_search_stats: dict[str, int | float | str] = {}
 
     def search(
@@ -247,10 +307,11 @@ class KlineSimilarityEngine:
         q_events = _event_features(q, query_symbol, previous_close=query_prev_close)
         latest_date = None
         if latest_only:
-            latest_date = max(
+            latest_getter = getattr(self.provider, "get_latest_date", None)
+            latest_date = (latest_getter(tf) if latest_getter is not None else max(
                 (_get_bars(self.provider, symbol, tf).date.max()
                  for symbol in self.provider.get_symbols()), default=pd.NaT,
-            )
+            ))
             if pd.isna(latest_date):
                 raise ValueError("market data has no latest K bars")
         mode = str(match_mode or self.config.length_mode).lower()
@@ -281,7 +342,7 @@ class KlineSimilarityEngine:
             stats["symbols_total"] += 1
             if latest_only and exclude_query and str(symbol) == str(query_symbol):
                 continue
-            frame = _valid_bars(_get_bars(self.provider, symbol, tf))
+            frame = _search_bars(self.provider, symbol, tf)
             if len(frame) < m:
                 continue
             if latest_only and (latest_date - frame.date.iloc[-1]).days > _latest_lag_days(tf):
@@ -341,7 +402,9 @@ class KlineSimilarityEngine:
             # This prevents a strong close-shape window from crowding an exact
             # limit-up/limit-down signature out of the per-stock recall list.
             if float(q_events.sum()) > 0:
-                event_selected = _local_minima(event_distances, self.config.local_top_n, radius)
+                event_selected = _local_minima(
+                    event_distances + 2.0 * (1.0 - special_coverage), self.config.local_top_n, radius,
+                )
                 for idx, _ in event_selected:
                     if np.isfinite(event_distances[idx]):
                         selected_paths.setdefault(idx, set()).add("event")
@@ -361,7 +424,7 @@ class KlineSimilarityEngine:
                                    "recall_paths": "+".join(sorted(paths))})
         stats["candidates_before_global_limit"] = len(candidates)
         candidates = _bounded_candidates(candidates, limit, self.config.event_recall_weight,
-                                         special_required=bool(q_events[:, SPECIAL_EVENT_CHANNELS].any()))
+                                         special_required=bool(q_events.any()))
         candidates = candidates[:limit]
         if not candidates:
             stats["candidates_after_global_limit"] = 0
@@ -372,7 +435,7 @@ class KlineSimilarityEngine:
         # Only now materialize OHLCV windows for the bounded Stage-2 set.
         # Stage 1 candidates remain metadata-only across the full universe.
         for item in candidates:
-            bars = _valid_bars(_get_bars(self.provider, item["symbol"], tf))
+            bars = _search_bars(self.provider, item["symbol"], tf)
             item["frame"] = bars.iloc[item["start_idx"]:item["end_idx"] + 1].reset_index(drop=True)
         # Global robust feature scale.  Median/IQR is deliberately computed
         # over the query and recalled windows, avoiding a second full-market pass.
@@ -401,7 +464,7 @@ class KlineSimilarityEngine:
             # Event channels are deliberately not robust-scaled: 0/1 event
             # identity must remain visible to DTW and cannot be washed out by
             # a large cross-market IQR.
-            event_scale = np.sqrt(max(self.config.special_event_weight, 0.0))
+            event_scale = np.sqrt(max(self.config.special_event_weight, 0.0) * EVENT_PRIORITY_WEIGHTS)
             weighted_q = np.hstack([weighted_q, q_events * event_scale])
             weighted_c = np.hstack([weighted_c, candidate_events * event_scale])
             dtw_distance = _constrained_dtw(weighted_q, weighted_c,
@@ -412,19 +475,22 @@ class KlineSimilarityEngine:
             cret = float(np.log(cframe.close.iloc[-1] / cframe.close.iloc[0]))
             qvol = float(np.std(np.diff(q_close)))
             cvol = float(np.std(np.diff(np.log(cframe.close.to_numpy(float)))))
+            event_distance, count_distance, order_distance = _event_sequence_distance(q_events, candidate_events)
             metrics.append(SimilarityMatch(
                 symbol=item["symbol"], start_date=cframe.date.iloc[0], end_date=cframe.date.iloc[-1],
                 score=0.0, mass_distance=item["mass_distance"], dtw_distance=dtw_distance,
                 aligned_distance=aligned, total_return_diff=abs(qret - cret),
-                event_distance=float(np.sqrt(np.mean((q_events - candidate_events) ** 2))),
+                event_distance=event_distance,
+                event_count_distance=count_distance, event_order_distance=order_distance,
                 special_event_match=special_match, missing_special_events=missing_special,
-                special_event_required=bool(q_events[:, SPECIAL_EVENT_CHANNELS].any()),
+                special_event_required=bool(q_events.any()),
                 volatility_diff=float(abs(np.log((cvol + 1e-9) / (qvol + 1e-9)))), window_length=m,
                 start_idx=item["start_idx"], end_idx=item["end_idx"],
                 query_length=m, length_ratio=1.0, match_mode="fixed",
             ))
         _assign_rank_scores(metrics, self.config, event_active=float(q_events.sum()) > 0)
-        _prioritize_special_events(metrics, q_events)
+        _apply_weekly_context(self, metrics, query_symbol, q, tf, stats)
+        _prioritize_special_events(metrics, q_events, enabled=self.config.hard_event_match)
         # Event features still affect both recall and the composite score
         # (and therefore remain a hard consideration for board-event-heavy
         # queries), but the public ranking must be ordered by the displayed
@@ -433,10 +499,140 @@ class KlineSimilarityEngine:
         metrics.sort(key=lambda x: (-x.score, x.symbol, x.start_date))
         result = _global_nms(metrics, top_k or self.config.top_k, overlap_threshold=self.config.exclusion_ratio)
         stats["final_results"] = len(result)
+        stats.update(_event_priority_stats(q_events, metrics, result, self.config))
         self.last_search_stats = stats
         if return_diagnostics:
             return {"results": result, "diagnostics": dict(self.last_search_stats)}
         return result
+
+
+def _prepare_weekly_context(frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Prepare one shortlisted stock once; aggregation remains causal per match."""
+    dates = frame.date.to_numpy(dtype="datetime64[ns]")
+    weeks = frame.date.dt.to_period("W-FRI").astype("int64").to_numpy()
+    starts = np.r_[0, np.flatnonzero(weeks[1:] != weeks[:-1]) + 1]
+    columns = [frame[col].to_numpy(float) for col in PRICE_COLUMNS]
+    columns.append(frame.vol.to_numpy(float) if "vol" in frame else np.zeros(len(frame)))
+    return dates, np.column_stack(columns), starts
+
+
+def _weekly_context_parts(prepared: tuple[np.ndarray, np.ndarray, np.ndarray],
+                          start: pd.Timestamp, end: pd.Timestamp,
+                          before: int) -> tuple[np.ndarray, np.ndarray]:
+    """Eight prior traded weekly bars plus interval weeks, truncated at end.
+
+    Rebuild the terminal partial week from daily data. Slicing a precomputed
+    Friday-labelled weekly table would include later days in that same week.
+    """
+    dates, prices, week_starts = prepared
+    left = int(np.searchsorted(dates, start.to_datetime64(), side="left"))
+    right = int(np.searchsorted(dates, end.to_datetime64(), side="right"))
+    if left >= right:
+        return np.empty((0, 5)), np.empty((0, 5))
+    first = int(np.searchsorted(week_starts, left, side="right")) - 1
+    last = int(np.searchsorted(week_starts, right - 1, side="right")) - 1
+    lo = max(0, first - before)
+    starts = week_starts[lo:last + 1]
+    offset = int(starts[0])
+    data = prices[offset:right]
+    groups = starts - offset
+    ends = np.r_[groups[1:] - 1, len(data) - 1]
+    weekly = np.column_stack([
+        data[groups, 0], np.maximum.reduceat(data[:, 1], groups),
+        np.minimum.reduceat(data[:, 2], groups), data[ends, 3],
+        np.add.reduceat(data[:, 4], groups),
+    ])
+    return weekly[:first - lo], weekly[first - lo:]
+
+
+def _weekly_context_distance(query: tuple[np.ndarray, np.ndarray],
+                             candidate: tuple[np.ndarray, np.ndarray],
+                             use_volume: bool) -> tuple[float, float, int]:
+    """Compare prior/interval segments independently to preserve the start anchor."""
+    qpre, qinside = query
+    cpre, cinside = candidate
+    common = min(len(qpre), len(cpre))
+    # Scale by query prices only, using the interval's opening level as anchor.
+    qanchor, canchor = qinside[0, 0], cinside[0, 0]
+    qprices = np.vstack([qpre, qinside])[:, :4]
+    scale = max(float(np.std(np.log(qprices / qanchor))), 0.05)
+    qvolume = max(float(np.mean(np.vstack([qpre, qinside])[:, 4])), 1e-9)
+    cvolume = max(float(np.mean(np.vstack([cpre, cinside])[:, 4])), 1e-9)
+    def features(bars: np.ndarray, anchor: float, volume: float) -> np.ndarray:
+        values = np.log(bars[:, :4] / anchor) / scale
+        if use_volume:
+            values = np.column_stack([values, np.log1p(bars[:, 4] / volume)])
+        return values
+    def distance(qbars: np.ndarray, cbars: np.ndarray) -> float:
+        qf, cf = features(qbars, qanchor, qvolume), features(cbars, canchor, cvolume)
+        grid = np.linspace(0.0, 1.0, 16)
+        def sample(values: np.ndarray) -> np.ndarray:
+            return np.column_stack([np.interp(grid, np.linspace(0.0, 1.0, len(values)), values[:, i])
+                                    for i in range(values.shape[1])])
+        diff = sample(qf) - sample(cf)
+        price = 0.6 * float(np.sqrt(np.mean(diff[:, 3] ** 2)))
+        price += 0.4 * float(np.sqrt(np.mean(diff[:, :4] ** 2)))
+        return 0.9 * price + 0.1 * float(np.sqrt(np.mean(diff[:, 4] ** 2))) if use_volume else price
+    interval_distance = distance(qinside, cinside)
+    if not len(qpre):
+        return interval_distance, 1.0, 0
+    # Missing prehistory cannot earn a perfect background score. Do not stretch
+    # a short IPO history into eight weeks or drop the stock from the result.
+    coverage = 0.6 + 0.4 * common / len(qpre)
+    if not common:
+        return interval_distance, coverage, 0
+    return (0.4 * distance(qpre[-common:], cpre[-common:]) + 0.6 * interval_distance,
+            coverage, common)
+
+
+def _apply_weekly_context(engine: KlineSimilarityEngine, items: list[SimilarityMatch],
+                          query_symbol: str, query: pd.DataFrame, timeframe: str,
+                          stats: dict) -> None:
+    """Fuse daily and weekly evidence before applying the existing event bands."""
+    started = perf_counter()
+    config = engine.config
+    stats.update(weekly_context_active=0, weekly_context_policy="causal_daily_to_weekly_v1",
+                 weekly_context_before=config.weekly_context_bars, weekly_context_after=0,
+                 weekly_context_weight=config.weekly_context_weight)
+    for item in items:
+        item.daily_score = item.score
+    if timeframe != "1d" or config.weekly_context_weight == 0 or not items:
+        stats["weekly_context_s"] = perf_counter() - started
+        return
+    prepared = _prepare_weekly_context(_search_bars(engine.provider, query_symbol, "1d"))
+    qparts = _weekly_context_parts(prepared, query.date.iloc[0], query.date.iloc[-1],
+                                   config.weekly_context_bars)
+    stats.update(weekly_query_pre_bars=len(qparts[0]), weekly_query_interval_bars=len(qparts[1]))
+    if sum(map(len, qparts)) < 3:
+        stats["weekly_context_s"] = perf_counter() - started
+        return
+    # Bounded by the existing Stage-2 budget. No extra all-market weekly scan.
+    by_symbol: dict[str, list[SimilarityMatch]] = {}
+    for item in items:
+        by_symbol.setdefault(item.symbol, []).append(item)
+    evaluated = 0
+    for symbol, matches in by_symbol.items():
+        source = (prepared if symbol == query_symbol else
+                  _prepare_weekly_context(_search_bars(engine.provider, symbol, "1d")))
+        for item in matches:
+            cparts = _weekly_context_parts(source, item.start_date, item.end_date, config.weekly_context_bars)
+            if not len(cparts[1]):
+                continue
+            distance, coverage, common = _weekly_context_distance(qparts, cparts, config.use_volume)
+            # Too few total weekly bars carry less evidence than the query.
+            coverage *= min(1.0, sum(map(len, cparts)) / 3)
+            item.weekly_context_active = True
+            item.weekly_context_distance = distance
+            item.weekly_context_score = coverage / (1.0 + distance)
+            item.weekly_context_coverage = coverage
+            item.weekly_context_pre_bars = common
+            item.weekly_context_interval_bars = len(cparts[1])
+            item.weekly_context_weight_used = config.weekly_context_weight
+            item.score = ((1.0 - config.weekly_context_weight) * item.daily_score
+                          + config.weekly_context_weight * item.weekly_context_score)
+            evaluated += 1
+    stats.update(weekly_context_active=int(evaluated > 0), weekly_context_candidates=evaluated,
+                 weekly_context_s=perf_counter() - started)
 
 
 def _valid_bars(frame: pd.DataFrame) -> pd.DataFrame:
@@ -515,7 +711,7 @@ def _coarse_structure_distance(query: pd.DataFrame, series: pd.DataFrame,
     return result
 
 
-def _state_features(frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+def _state_features(frame: pd.DataFrame, events: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
     """Return low-cardinality causal states and per-bar salience."""
     features = _features(frame, use_volume=True)
     returns, body = features[:, 0], np.abs(features[:, 2])
@@ -526,7 +722,7 @@ def _state_features(frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     wick_type = np.select([upper > lower * 1.8, lower > upper * 1.8], [0, 2], default=1)
     volume_state = np.select([volume < -0.35, volume > 0.50], [0, 2], default=1)
     states = np.column_stack([direction, volatility, body_type, wick_type, volume_state]).astype(np.int8)
-    event = _event_features(frame)
+    event = _event_features(frame) if events is None else events
     salience = np.clip(0.15 + 0.20 * np.minimum(ranges, 3.0) + 0.15 * np.minimum(np.abs(volume), 3.0), 0.0, 0.85)
     salience = np.maximum(salience, event.max(axis=1))
     return states, salience
@@ -588,13 +784,44 @@ def _prepare_elastic_frame(frame: pd.DataFrame) -> tuple[np.ndarray, ...]:
     return tuple(frame[col].to_numpy(float) for col in ("open", "high", "low", "close", "vol"))
 
 
+def _elastic_window_prefixes(states: np.ndarray, events: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Reuse binary event counts and state histograms across overlapping buckets."""
+    state_prefix = np.zeros((len(states) + 1, states.shape[1], 3), dtype=np.int32)
+    np.cumsum(np.eye(3, dtype=np.int32)[states], axis=0, dtype=np.int32,
+              out=state_prefix[1:])
+    event_prefix = np.zeros((len(events) + 1, events.shape[1]), dtype=np.int32)
+    np.cumsum(events > 0, axis=0, dtype=np.int32, out=event_prefix[1:])
+    return state_prefix, event_prefix
+
+
+def _latest_shape_event_distances(frame: pd.DataFrame, frame_events: np.ndarray,
+                                  lengths: list[int], prepared_queries: dict[int, tuple]
+                                  ) -> dict[int, tuple[float, float]]:
+    """Evaluate only the terminal window for each length using recall's bucket rules."""
+    log_close = np.log(frame.close.to_numpy(float))
+    result = {}
+    for length in lengths:
+        if len(frame) < length:
+            continue
+        groups, q_norm, _, _, _, q_events = prepared_queries[length]
+        start = len(frame) - length
+        closes = np.array([log_close[start + group[-1]] for group in groups])
+        normalized = (closes - closes.mean()) / max(closes.std(), 1e-12)
+        shape = float(np.sqrt(np.mean((normalized - q_norm) ** 2)))
+        events = np.array([frame_events[start + group].max(axis=0) for group in groups])
+        event = float(np.sqrt(np.mean((events - q_events) ** 2)))
+        result[length] = (shape, event)
+    return result
+
+
 def _elastic_coarse_distances(query: pd.DataFrame, frame: pd.DataFrame,
                               query_states: np.ndarray, frame_states: np.ndarray,
                               query_events: np.ndarray, frame_events: np.ndarray,
                               length: int, use_volume: bool, prepared: tuple | None = None,
                               frame_arrays: tuple[np.ndarray, ...] | None = None,
                               compiled_prices: np.ndarray | None = None,
-                              start_step: int = 1
+                              start_step: int = 1,
+                              window_prefixes: tuple[np.ndarray, np.ndarray] | None = None,
                               ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Calculate the four coarse recall channels in window batches.
 
@@ -616,6 +843,8 @@ def _elastic_coarse_distances(query: pd.DataFrame, frame: pd.DataFrame,
                                           q_states, q_events, use_volume, start_step)
     opens, highs, lows, closes, volumes = (frame_arrays if frame_arrays is not None
                                            else _prepare_elastic_frame(frame))
+    state_prefix, event_prefix = (window_prefixes if window_prefixes is not None
+                                  else _elastic_window_prefixes(frame_states, frame_events))
     shape = np.empty(count)
     structure = np.empty(count)
     state = np.empty(count)
@@ -626,8 +855,6 @@ def _elastic_coarse_distances(query: pd.DataFrame, frame: pd.DataFrame,
         n = len(starts)
         o = np.empty((n, buckets)); h = np.empty_like(o)
         l = np.empty_like(o); c = np.empty_like(o); v = np.empty_like(o)
-        states = np.empty((n, buckets, frame_states.shape[1]), dtype=np.int8)
-        events = np.empty((n, buckets, frame_events.shape[1]))
         for col, offsets in enumerate(groups):
             positions = starts[:, None] + offsets[None, :]
             o[:, col] = opens[starts + offsets[0]]
@@ -635,12 +862,10 @@ def _elastic_coarse_distances(query: pd.DataFrame, frame: pd.DataFrame,
             l[:, col] = lows[positions].min(axis=1)
             c[:, col] = closes[starts + offsets[-1]]
             v[:, col] = volumes[positions].sum(axis=1)
-            state_group = frame_states[positions]
-            for channel in range(frame_states.shape[1]):
-                counts = np.stack([(state_group[:, :, channel] == value).sum(axis=1)
-                                   for value in range(3)], axis=1)
-                states[:, col, channel] = counts.argmax(axis=1)
-            events[:, col] = frame_events[positions].max(axis=1)
+        first = starts[:, None] + np.array([group[0] for group in groups])[None, :]
+        last = starts[:, None] + np.array([group[-1] + 1 for group in groups])[None, :]
+        states = (state_prefix[last] - state_prefix[first]).argmax(axis=3)
+        events = event_prefix[last] > event_prefix[first]
         log_close = np.log(c)
         normalized = (log_close - log_close.mean(axis=1, keepdims=True)) / np.maximum(log_close.std(axis=1, keepdims=True), 1e-12)
         shape[base:stop] = np.sqrt(np.mean((normalized - q_norm) ** 2, axis=1))
@@ -668,6 +893,9 @@ def _elastic_coarse_distances(query: pd.DataFrame, frame: pd.DataFrame,
 def _state_edit_distance(query_states: np.ndarray, candidate_states: np.ndarray,
                          query_salience: np.ndarray, candidate_salience: np.ndarray) -> float:
     """Weighted Levenshtein distance for direction/volatility/candle states."""
+    if _compiled_state_edit_distance is not None:
+        return float(_compiled_state_edit_distance(query_states, candidate_states,
+                                                   query_salience, candidate_salience))
     n, m = len(query_states), len(candidate_states)
     dp = np.full((n + 1, m + 1), np.inf)
     dp[0, 0] = 0.0
@@ -720,6 +948,9 @@ def _elastic_dtw(a: np.ndarray, b: np.ndarray, a_salience: np.ndarray,
                  max_repeat_step: int, gap_penalty: float,
                  salient_gap_multiplier: float) -> tuple[float, int, int, int]:
     """Elastic DTW with normalized band and bounded horizontal/vertical runs."""
+    if _compiled_elastic_dtw is not None:
+        return _compiled_elastic_dtw(a, b, a_salience, b_salience, normalized_band,
+                                     max_repeat_step, gap_penalty, salient_gap_multiplier)
     n, m = len(a), len(b)
     inf = float("inf")
     runs = max(1, int(max_repeat_step))
@@ -784,9 +1015,10 @@ def _elastic_search(engine: KlineSimilarityEngine, query_symbol: str, q: pd.Data
                     exclude_query: bool, *, min_length: int | None,
                     max_length: int | None, latest_date: pd.Timestamp | None = None) -> list[SimilarityMatch]:
     """Run bounded multi-length recall followed by elastic Stage 2 alignment."""
+    search_started = perf_counter()
     config = engine.config
     query_length = len(q)
-    query_states, query_salience = _state_features(q)
+    query_states, query_salience = _state_features(q, q_events)
     lengths = _candidate_lengths(query_length, config, min_length, max_length, mode="elastic")
     if min_length is None and max_length is None and len(lengths) > 3:
         shorter = min((value for value in lengths if value < query_length),
@@ -805,6 +1037,8 @@ def _elastic_search(engine: KlineSimilarityEngine, query_symbol: str, q: pd.Data
         "symbols_total": 0, "symbols_eligible": 0, "windows_total": 0,
         "local_recall_total": 0, "mass_path_total": 0, "structure_path_total": 0,
         "state_path_total": 0, "event_path_total": 0, "candidates_before_global_limit": 0,
+        "coarse_backend": "numba" if _compiled_coarse_distances is not None else "numpy",
+        "dtw_backend": "numba" if _compiled_elastic_dtw is not None else "python",
     }
     limit = int(recall_n or config.recall_n)
     event_active = bool(q_events.any())
@@ -812,36 +1046,37 @@ def _elastic_search(engine: KlineSimilarityEngine, query_symbol: str, q: pd.Data
         stats["symbols_total"] += 1
         if latest_date is not None and exclude_query and str(symbol) == str(query_symbol):
             continue
-        frame = _valid_bars(_get_bars(engine.provider, symbol, timeframe))
+        frame = _search_bars(engine.provider, symbol, timeframe)
         if len(frame) < min(lengths):
             continue
         if latest_date is not None and (latest_date - frame.date.iloc[-1]).days > _latest_lag_days(timeframe):
             continue
         stats["symbols_eligible"] += 1
         if latest_date is not None:
+            frame_events = _event_features(frame, str(symbol))
+            distances = _latest_shape_event_distances(frame, frame_events, lengths, prepared_queries)
             for length in lengths:
                 start_idx = len(frame) - length
-                if start_idx < 0:
+                if length not in distances:
                     continue
-                window = frame.iloc[start_idx:].reset_index(drop=True)
                 previous_close = float(frame.close.iloc[start_idx - 1]) if start_idx else None
-                events = _event_features(window, str(symbol), previous_close=previous_close)
-                coverage, missing = _special_event_match(q_events, events)
-                states, _ = _state_features(window)
+                coverage, missing = _special_event_match(q_events, frame_events[start_idx:])
                 candidates.append({
                     "symbol": str(symbol), "start_idx": start_idx, "end_idx": len(frame) - 1,
-                    "length": length, "mass_distance": float(_coarse_shape_distance(q, window, length)[0]),
-                    "event_distance": float(_coarse_event_distance(q_events, events, length)[0]),
+                    "length": length, "mass_distance": distances[length][0],
+                    "event_distance": distances[length][1],
                     "special_event_match": coverage, "missing_special_events": missing,
                     "previous_close": previous_close, "recall_paths": "mass+structure+event",
                 })
                 stats["windows_total"] += 1
                 stats["local_recall_total"] += 1
             continue
-        frame_states, _ = _state_features(frame)
         frame_events = _event_features(frame, str(symbol))
+        frame_states, _ = _state_features(frame, frame_events)
         frame_arrays = _prepare_elastic_frame(frame)
         compiled_prices = np.ascontiguousarray(np.column_stack(frame_arrays)) if _compiled_coarse_distances is not None else None
+        window_prefixes = (_elastic_window_prefixes(frame_states, frame_events)
+                           if _compiled_coarse_distances is None else None)
         frame_dates = frame.date.to_numpy()
         query_dates = frame_dates.astype("datetime64[D]") if exclude_query and str(symbol) == str(query_symbol) else None
         for length in lengths:
@@ -850,7 +1085,7 @@ def _elastic_search(engine: KlineSimilarityEngine, query_symbol: str, q: pd.Data
             shape, structure, state, event = _elastic_coarse_distances(
                 q, frame, query_states, frame_states, q_events, frame_events,
                 length, config.use_volume, prepared_queries[length], frame_arrays,
-                compiled_prices, scan_step,
+                compiled_prices, scan_step, window_prefixes,
             )
             count = len(shape)
             stats["windows_total"] += count
@@ -876,7 +1111,7 @@ def _elastic_search(engine: KlineSimilarityEngine, query_symbol: str, q: pd.Data
             selected_paths: dict[int, set[str]] = {}
             paths = (("mass", combined), ("structure", structure), ("state", state))
             if event_active:
-                paths += (("event", event),)
+                paths += (("event", event + 2.0 * (1.0 - special_coverage)),)
             for name, values in paths:
                 for idx, value in _local_minima(values, config.local_top_n, radius):
                     if np.isfinite(value):
@@ -898,17 +1133,25 @@ def _elastic_search(engine: KlineSimilarityEngine, query_symbol: str, q: pd.Data
                     "recall_paths": "+".join(sorted(paths)),
                 })
     stats["candidates_before_global_limit"] = len(candidates)
+    stats["recall_s"] = perf_counter() - search_started
+    selection_started = perf_counter()
     candidates = _bounded_candidates(candidates, limit, config.event_recall_weight,
-                                     special_required=bool(q_events[:, SPECIAL_EVENT_CHANNELS].any()))
+                                     special_required=bool(q_events.any()))
+    stats["candidate_selection_s"] = perf_counter() - selection_started
     stats["candidates_after_global_limit"] = len(candidates)
     if not candidates:
         stats["final_results"] = 0
+        stats["total_s"] = perf_counter() - search_started
         engine.last_search_stats = stats
         return []
-    return _elastic_rerank(
+    rerank_started = perf_counter()
+    result = _elastic_rerank(
         engine, q, q_close, q_features, q_events, query_states, query_salience,
-        candidates, timeframe, top_k, stats,
+        candidates, timeframe, top_k, stats, query_symbol,
     )
+    stats["rerank_s"] = perf_counter() - rerank_started
+    stats["total_s"] = perf_counter() - search_started
+    return result
 
 
 def _elastic_rerank(engine: KlineSimilarityEngine, q: pd.DataFrame,
@@ -916,7 +1159,7 @@ def _elastic_rerank(engine: KlineSimilarityEngine, q: pd.DataFrame,
                     q_events: np.ndarray, query_states: np.ndarray,
                     query_salience: np.ndarray, candidates: list[dict],
                     timeframe: str, top_k: int | None,
-                    stats: dict[str, int | float | str]) -> list[SimilarityMatch]:
+                    stats: dict[str, int | float | str], query_symbol: str) -> list[SimilarityMatch]:
     config = engine.config
     query_length = len(q)
     feature_scale = np.maximum(np.nanstd(q_features, axis=0), 1e-3)
@@ -927,7 +1170,7 @@ def _elastic_rerank(engine: KlineSimilarityEngine, q: pd.DataFrame,
     metrics: list[SimilarityMatch] = []
     qret = float(np.log(q.close.iloc[-1] / q.close.iloc[0]))
     qvol = float(np.std(np.diff(q_close)))
-    bars_by_symbol = {symbol: _valid_bars(_get_bars(engine.provider, symbol, timeframe))
+    bars_by_symbol = {symbol: _search_bars(engine.provider, symbol, timeframe)
                       for symbol in {item["symbol"] for item in candidates}}
     for item in candidates:
         bars = bars_by_symbol[item["symbol"]]
@@ -936,10 +1179,10 @@ def _elastic_rerank(engine: KlineSimilarityEngine, q: pd.DataFrame,
         weighted_c = c_features / feature_scale * weights
         candidate_events = _event_features(cframe, item["symbol"], previous_close=item.get("previous_close"))
         special_match, missing_special = _special_event_match(q_events, candidate_events)
-        event_scale = np.sqrt(max(config.special_event_weight, 0.0))
+        event_scale = np.sqrt(max(config.special_event_weight, 0.0) * EVENT_PRIORITY_WEIGHTS)
         aligned_q = np.hstack([weighted_q, q_events * event_scale])
         aligned_c = np.hstack([weighted_c, candidate_events * event_scale])
-        candidate_states, candidate_salience = _state_features(cframe)
+        candidate_states, candidate_salience = _state_features(cframe, candidate_events)
         elastic_shape, warp_length, skipped_q, skipped_c = _elastic_dtw(
             aligned_q, aligned_c, query_salience, candidate_salience,
             config.normalized_warp_band, config.max_repeat_step,
@@ -948,15 +1191,16 @@ def _elastic_rerank(engine: KlineSimilarityEngine, q: pd.DataFrame,
         state_distance = _state_edit_distance(query_states, candidate_states, query_salience, candidate_salience)
         cret = float(np.log(cframe.close.iloc[-1] / cframe.close.iloc[0]))
         cvol = float(np.std(np.diff(np.log(cframe.close.to_numpy(float)))))
-        event_distance = float(np.sqrt(np.mean((q_events.mean(axis=0) - candidate_events.mean(axis=0)) ** 2)))
+        event_distance, count_distance, order_distance = _event_sequence_distance(q_events, candidate_events)
         aligned = _resampled_distance(aligned_q, aligned_c)
         metrics.append(SimilarityMatch(
             symbol=item["symbol"], start_date=cframe.date.iloc[0], end_date=cframe.date.iloc[-1],
             score=0.0, mass_distance=float(item["mass_distance"]), dtw_distance=elastic_shape,
             aligned_distance=aligned, total_return_diff=abs(qret - cret),
             volatility_diff=float(abs(np.log((cvol + 1e-9) / (qvol + 1e-9)))), event_distance=event_distance,
+            event_count_distance=count_distance, event_order_distance=order_distance,
             special_event_match=special_match, missing_special_events=missing_special,
-            special_event_required=bool(q_events[:, SPECIAL_EVENT_CHANNELS].any()),
+            special_event_required=bool(q_events.any()),
             window_length=len(cframe), start_idx=item["start_idx"], end_idx=item["end_idx"],
             query_length=query_length, length_ratio=len(cframe) / query_length, match_mode="elastic",
             elastic_shape_distance=elastic_shape, state_distance=state_distance,
@@ -967,9 +1211,10 @@ def _elastic_rerank(engine: KlineSimilarityEngine, q: pd.DataFrame,
         path_summary = 0.5 * min(item.total_return_diff, 2.0) + 0.5 * min(item.volatility_diff, 2.0)
         total = (0.30 * item.elastic_shape_distance + 0.25 * item.state_distance +
                  0.20 * item.anchor_distance + 0.10 * path_summary +
-                 0.08 * item.event_distance + 0.05 * item.length_penalty)
+                 config.special_event_weight * item.event_distance + 0.05 * item.length_penalty)
         item.score = float(1.0 / (1.0 + max(total, 0.0)))
-    _prioritize_special_events(metrics, q_events)
+    _apply_weekly_context(engine, metrics, query_symbol, q, timeframe, stats)
+    _prioritize_special_events(metrics, q_events, enabled=config.hard_event_match)
     metrics.sort(key=lambda x: (-x.score, x.symbol, x.start_date))
     result = _global_nms(metrics, top_k or config.top_k, overlap_threshold=config.exclusion_ratio)
     stats["stage2_candidates"] = len(metrics)
@@ -978,6 +1223,7 @@ def _elastic_rerank(engine: KlineSimilarityEngine, q: pd.DataFrame,
     stats["skipped_query_bars_total"] = int(sum(x.skipped_query_bars for x in metrics))
     stats["skipped_candidate_bars_total"] = int(sum(x.skipped_candidate_bars for x in metrics))
     stats["final_results"] = len(result)
+    stats.update(_event_priority_stats(q_events, metrics, result, config))
     engine.last_search_stats = stats
     return result
 
@@ -987,6 +1233,13 @@ def _get_bars(provider: MarketDataProvider, symbol: str, timeframe: str) -> pd.D
     if getter is not None:
         return getter(symbol, timeframe)
     return aggregate_bars(provider.get_symbol_data(symbol), timeframe)
+
+
+def _search_bars(provider: MarketDataProvider, symbol: str, timeframe: str) -> pd.DataFrame:
+    getter = getattr(provider, "get_search_bars", None)
+    if getter is not None:
+        return getter(symbol, timeframe)
+    return _valid_bars(_get_bars(provider, symbol, timeframe))
 
 
 def _features(frame: pd.DataFrame, use_volume: bool = True) -> np.ndarray:
@@ -1082,18 +1335,18 @@ def _event_features(frame: pd.DataFrame, symbol: str | None = None,
 
 def _special_event_match(query_events: np.ndarray,
                          candidate_events: np.ndarray) -> tuple[float, int]:
-    """Measure whether the candidate contains the query's rare board types.
+    """Measure coverage of all query board types and their minimum counts.
 
-    A T-board also has the high-open channel; a one-word board also has it.
-    Missing either subtype is therefore penalized more than a generic limit-up.
-    The count comparison allows elastic windows to differ in length or position.
+    The historical function/field names are retained for API compatibility.
+    Ordinary limit-up/down now receive the same recall and priority policy;
+    the additional subtype channels retain their larger weights. Missing
+    counts refer to channel requirements, not distinct candle counts.
     """
-    channels = SPECIAL_EVENT_CHANNELS
-    weights = SPECIAL_EVENT_WEIGHTS
-    required = np.rint(query_events[:, channels].sum(axis=0)).astype(int)
+    weights = EVENT_PRIORITY_WEIGHTS
+    required = np.rint(query_events.sum(axis=0)).astype(int)
     if not required.any():
         return 1.0, 0
-    observed = np.rint(candidate_events[:, channels].sum(axis=0)).astype(int)
+    observed = np.rint(candidate_events.sum(axis=0)).astype(int)
     missing = np.maximum(required - observed, 0)
     need_weight = float(np.dot(required, weights))
     coverage = 1.0 - float(np.dot(missing, weights)) / need_weight
@@ -1102,27 +1355,79 @@ def _special_event_match(query_events: np.ndarray,
 
 def _special_event_coverage_windows(query_events: np.ndarray, series_events: np.ndarray,
                                     starts: np.ndarray, length: int) -> tuple[np.ndarray, np.ndarray]:
-    channels = SPECIAL_EVENT_CHANNELS
-    weights = SPECIAL_EVENT_WEIGHTS
-    required = np.rint(query_events[:, channels].sum(axis=0)).astype(int)
+    weights = EVENT_PRIORITY_WEIGHTS
+    required = np.rint(query_events.sum(axis=0)).astype(int)
     if not required.any():
         return np.ones(len(starts)), np.zeros(len(starts), dtype=int)
-    flags = np.rint(series_events[:, channels]).astype(int)
-    prefix = np.vstack((np.zeros((1, len(channels)), dtype=int), np.cumsum(flags, axis=0)))
+    flags = np.rint(series_events).astype(int)
+    prefix = np.vstack((np.zeros((1, len(weights)), dtype=int), np.cumsum(flags, axis=0)))
     observed = prefix[starts + length] - prefix[starts]
     missing = np.maximum(required - observed, 0)
     coverage = 1.0 - (missing @ weights) / float(required @ weights)
     return np.maximum(coverage, 0.0), missing.sum(axis=1)
 
 
-def _prioritize_special_events(items: list[SimilarityMatch], query_events: np.ndarray) -> None:
-    if not query_events[:, SPECIAL_EVENT_CHANNELS].any():
-        return
+def _event_sequence_distance(query: np.ndarray, candidate: np.ndarray) -> tuple[float, float, float]:
+    """Compare per-type counts and relative positions without quiet-bar dilution.
+
+    Sorted occurrences are compared at common quantiles, preserving temporal
+    order while allowing elastic windows to contain different bar counts.
+    A missing/extra channel costs one in both components. The weighted mean
+    uses only channels present in either sequence, never all quiet candles.
+    """
+    count_error = position_error = total_weight = 0.0
+    for channel, weight in enumerate(EVENT_PRIORITY_WEIGHTS):
+        q = np.flatnonzero(query[:, channel]) / max(len(query) - 1, 1)
+        c = np.flatnonzero(candidate[:, channel]) / max(len(candidate) - 1, 1)
+        if not len(q) and not len(c):
+            continue
+        count = abs(len(q) - len(c)) / max(len(q), len(c), 1)
+        position = 1.0
+        if len(q) and len(c):
+            grid = np.linspace(0.0, 1.0, max(len(q), len(c)))
+            q_positions = np.interp(grid, np.linspace(0.0, 1.0, len(q)), q)
+            c_positions = np.interp(grid, np.linspace(0.0, 1.0, len(c)), c)
+            position = float(np.mean(np.abs(q_positions - c_positions)))
+        count_error += weight * count
+        position_error += weight * position
+        total_weight += weight
+    if not total_weight:
+        return 0.0, 0.0, 0.0
+    count_error /= total_weight
+    position_error /= total_weight
+    return 0.65 * count_error + 0.35 * position_error, count_error, position_error
+
+
+def _prioritize_special_events(items: list[SimilarityMatch], query_events: np.ndarray,
+                               *, enabled: bool = True) -> None:
     for item in items:
-        # Exact subtype coverage receives the upper score band; partial
-        # coverage remains rankable if no exact historical analogue exists.
-        item.score = (0.5 + 0.5 * item.score if item.missing_special_events == 0
-                      else 0.5 * item.score * item.special_event_match)
+        item.base_score = item.score
+        if enabled and query_events.any():
+            # Separate exact sequences, complete type/count coverage and
+            # partial coverage. Preserve shape ordering even when no event
+            # matches; normalized positions and extra events affect quality.
+            base = float(np.clip(item.score, 0.0, 1.0))
+            event_quality = item.special_event_match * float(np.clip(1.0 - item.event_distance, 0.0, 1.0))
+            exact_sequence = item.missing_special_events == 0 and item.event_distance <= 1e-9
+            if exact_sequence:
+                item.score = 0.5 + 0.5 * base
+            elif item.missing_special_events == 0:
+                item.score = 0.25 + 0.25 * base * event_quality
+            else:
+                item.score = 0.25 * (0.5 * base + 0.5 * event_quality)
+
+
+def _event_priority_stats(query_events: np.ndarray, items: list[SimilarityMatch],
+                          results: list[SimilarityMatch], config: SimilarityConfig) -> dict:
+    return {
+        "event_policy": "all_board_types_v2",
+        "event_priority_active": int(config.hard_event_match and bool(query_events.any())),
+        "event_weight": config.special_event_weight,
+        "query_event_counts": ",".join(f"{name}:{int(count)}" for name, count in
+                                       zip(EVENT_NAMES, query_events.sum(axis=0))),
+        "event_complete_candidates": sum(x.missing_special_events == 0 for x in items),
+        "event_complete_results": sum(x.missing_special_events == 0 for x in results),
+    }
 
 
 def _event_window_distances(query_events: np.ndarray, series_events: np.ndarray) -> np.ndarray:
@@ -1206,6 +1511,8 @@ def _local_minima(distances: np.ndarray, count: int, radius: int) -> list[tuple[
 
 def _constrained_dtw(a: np.ndarray, b: np.ndarray, radius: int) -> float:
     """Banded rolling-row constrained DTW; memory is O(window * features)."""
+    if _compiled_fixed_dtw is not None:
+        return float(_compiled_fixed_dtw(a, b, radius))
     n, m = len(a), len(b)
     inf = float("inf")
     prev = np.full(m + 1, inf)
@@ -1245,16 +1552,8 @@ def _assign_rank_scores(items: list[SimilarityMatch], config: SimilarityConfig,
                     config.aligned_weight * item.aligned_rank + config.return_weight * item.return_rank +
                     config.volatility_weight * item.volatility_rank + config.special_event_weight * item.event_rank)
         item.score = float(1.0 - distance)
-        # ``hard_event_match`` gives exact event signatures a clear priority
-        # band, while keeping a continuous penalty among non-exact windows.
-        # This avoids collapsing every result below 0.5 when the market has
-        # no perfect historical event sequence.
-        if config.hard_event_match and event_active:
-            base_score = item.score
-            if item.event_distance <= 1e-12:
-                item.score = 0.5 + 0.5 * base_score
-            else:
-                item.score = 0.5 * base_score - 0.5 * min(item.event_distance, 1.0)
+        # Apply the common type/count priority exactly once after fusion,
+        # matching elastic mode; event location still affects this base score.
 
 
 def _overlap_ratio(a_start, a_end, b_start, b_end) -> float:

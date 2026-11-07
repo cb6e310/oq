@@ -1,0 +1,35 @@
+{
+  "stocks": 61,
+  "rows": 210181,
+  "runs": [
+    {
+      "mode": "fixed",
+      "scope": "history",
+      "total_s": 4.1054,
+      "weekly_s": 0.3834,
+      "weekly_candidates": 100,
+      "top_symbol": "000025.SZ",
+      "weekly_score": 0.3900314856315375,
+      "daily_score": 0.7378787878787879,
+      "final_score": 0.3715118297784741,
+      "dtw_backend": "numba"
+    },
+    {
+      "mode": "elastic",
+      "scope": "history",
+      "total_s": 1.6154,
+      "weekly_s": 0.2999,
+      "weekly_candidates": 100,
+      "top_symbol": "000010.SZ",
+      "weekly_score": 0.4710627809208943,
+      "daily_score": 0.6794542614453082,
+      "final_score": 0.403047956751733,
+      "dtw_backend": "numba"
+    }
+  ],
+  "repeated_candidates_check": {
+    "candidates": 1000,
+    "distinct_stocks": 4,
+    "weekly_s": 0.3365
+  }
+}

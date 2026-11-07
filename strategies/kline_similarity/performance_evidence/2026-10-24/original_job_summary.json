@@ -1,0 +1,42 @@
+{
+  "id": "d2da4d640e9845978ade677c5d0bc6e7",
+  "created_at": "2026-10-24 10:23:46",
+  "stock": {
+    "symbol": "603767",
+    "name": "中马传动",
+    "exchange": "SH",
+    "ts_code": "603767.SH"
+  },
+  "start": "2026-07-21",
+  "end": "2026-10-24",
+  "timeframe": "1d",
+  "match_mode": "elastic",
+  "min_length": null,
+  "max_length": null,
+  "candidate_scope": "history",
+  "result_count": 20,
+  "html_path": "/files/strategies/kline_similarity/ui_results/20261024_095913_d2da4d64/similarity_603767.SH_1d_top20.html",
+  "search_stats": {
+    "candidate_scope": "history",
+    "match_mode": "elastic",
+    "query_length": 63,
+    "length_candidates": 3,
+    "length_grid": "50,63,76",
+    "symbols_total": 5917,
+    "symbols_eligible": 5876,
+    "windows_total": 37258957,
+    "local_recall_total": 1299557,
+    "mass_path_total": 343108,
+    "structure_path_total": 342967,
+    "state_path_total": 342919,
+    "event_path_total": 343984,
+    "candidates_before_global_limit": 1299557,
+    "candidates_after_global_limit": 1000,
+    "stage2_candidates": 1000,
+    "candidate_length_min": 50,
+    "candidate_length_max": 76,
+    "skipped_query_bars_total": 10555,
+    "skipped_candidate_bars_total": 12258,
+    "final_results": 20
+  }
+}

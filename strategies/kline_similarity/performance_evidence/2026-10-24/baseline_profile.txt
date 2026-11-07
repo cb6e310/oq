@@ -1,0 +1,43 @@
+         3974758 function calls (3962380 primitive calls) in 14.204 seconds
+
+   Ordered by: cumulative time
+   List reduced from 814 to 35 due to restriction <35>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    0.000    0.000   14.204   14.204 engine.py:241(search)
+        1    0.162    0.162   14.194   14.194 engine.py:843(_elastic_search)
+      117    3.607    0.031    7.570    0.065 engine.py:648(_elastic_coarse_distances)
+        1    0.009    0.009    5.776    5.776 engine.py:976(_elastic_rerank)
+   315634    3.616    0.000    3.616    0.000 {method 'reduce' of 'numpy.ufunc' objects}
+       40    1.526    0.038    3.080    0.077 engine.py:725(_state_edit_distance)
+       40    1.624    0.041    2.520    0.063 engine.py:778(_elastic_dtw)
+    97215    0.084    0.000    1.722    0.000 {method 'sum' of 'numpy.ndarray' objects}
+    97215    0.037    0.000    1.638    0.000 _methods.py:47(_sum)
+   166143    0.267    0.000    1.391    0.000 fromnumeric.py:2304(sum)
+   166144    0.343    0.000    1.065    0.000 fromnumeric.py:66(_wrapreduction)
+    12573    0.015    0.000    0.892    0.000 {method 'max' of 'numpy.ndarray' objects}
+    12573    0.006    0.000    0.877    0.000 _methods.py:39(_amax)
+    31917    0.068    0.000    0.679    0.000 fromnumeric.py:3699(mean)
+    32189    0.167    0.000    0.625    0.000 _methods.py:115(_mean)
+    30429    0.511    0.000    0.546    0.000 shape_base.py:378(stack)
+    30800    0.370    0.000    0.370    0.000 {method 'argmax' of 'numpy.ndarray' objects}
+    41214    0.071    0.000    0.230    0.000 fromnumeric.py:1321(argmin)
+     6340    0.006    0.000    0.215    0.000 {method 'min' of 'numpy.ndarray' objects}
+     6340    0.003    0.000    0.208    0.000 _methods.py:43(_amin)
+     9199    0.019    0.000    0.199    0.000 indexing.py:1177(__getitem__)
+    10413    0.018    0.000    0.197    0.000 generic.py:6306(__getattr__)
+    43055    0.042    0.000    0.175    0.000 fromnumeric.py:48(_wrapfunc)
+     9197    0.025    0.000    0.159    0.000 indexing.py:1720(_getitem_axis)
+    32422    0.142    0.000    0.155    0.000 _methods.py:73(_count_reduce_items)
+372988/372848    0.119    0.000    0.153    0.000 {built-in method builtins.isinstance}
+    10976    0.038    0.000    0.147    0.000 frame.py:4073(__getitem__)
+       80    0.008    0.000    0.140    0.002 engine.py:555(_state_features)
+   175695    0.132    0.000    0.132    0.000 {built-in method builtins.min}
+      468    0.067    0.000    0.130    0.000 engine.py:1262(_local_minima)
+   352893    0.114    0.000    0.114    0.000 {built-in method builtins.max}
+      124    0.021    0.000    0.108    0.001 engine.py:1061(_features)
+    41214    0.103    0.000    0.103    0.000 {method 'argmin' of 'numpy.ndarray' objects}
+      160    0.023    0.000    0.072    0.000 engine.py:1115(_event_features)
+        3    0.000    0.000    0.071    0.024 engine.py:609(_prepare_elastic_query)
+
+

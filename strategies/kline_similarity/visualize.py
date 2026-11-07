@@ -167,10 +167,14 @@ def build_visual_results(
                     f"长度 {match.window_length}/{match.query_length}（{match.length_ratio:.2f}x） · "
                     f"MASS {match.mass_distance:.4f} · DTW {match.dtw_distance:.4f} · "
                     f"区间 {match.start_date:%Y-%m-%d} 至 {match.end_date:%Y-%m-%d} · "
-                    f"特殊板事件距离 {match.event_distance:.4f}")
+                    f"涨跌停/特殊事件距离 {match.event_distance:.4f}")
         if match.special_event_required:
-            subtitle += (f" · 特殊板匹配 {match.special_event_match:.0%}"
-                         f" · 缺少 {match.missing_special_events} 根")
+            subtitle += (f" · 事件覆盖 {match.special_event_match:.0%}"
+                         f" · 缺少事件项 {match.missing_special_events}")
+        if match.weekly_context_active:
+            subtitle += (f" · 周线背景分 {match.weekly_context_score:.4f}"
+                         f" · 前置/区间 {match.weekly_context_pre_bars}/{match.weekly_context_interval_bars}周"
+                         f" · 仅截至区间终点已知行情")
         if match.match_mode == "elastic":
             subtitle += (f" · 状态 {match.state_distance:.4f} · 锚点 {match.anchor_distance:.4f} · "
                          f"跳过 Q/C {match.skipped_query_bars}/{match.skipped_candidate_bars}")
@@ -206,7 +210,10 @@ def build_visual_results(
     body = ["<!doctype html><meta charset='utf-8'><style>", mobile_css(), "</style><div class='wrap'>",
             f"<div class='head'><h1>{query_symbol} {tf} 相似 K 线 Top {len(results)}</h1>",
             f"<p>查询区间：{query_start:%Y-%m-%d} 至 {query_end:%Y-%m-%d}｜"
-            f"匹配模式：{(match_mode or engine.config.length_mode)}｜候选范围：{'最新走势' if latest_only else '历史区间'}｜日线前后各90根；周线、月线前后各22根</p></div>"]
+            f"匹配模式：{(match_mode or engine.config.length_mode)}｜候选范围：{'最新走势' if latest_only else '历史区间'}｜日线前后各90根；周线、月线前后各22根</p>",
+            (f"<p>日线联合评分：周线背景占 {engine.config.weekly_context_weight:.0%}，"
+             f"比较起点前最多{engine.config.weekly_context_bars}根周线及区间内截至终点已知的周线。"
+             "图表中的后续行情仅供复盘展示，不参与周线背景评分。</p>" if tf == "1d" else ""), "</div>"]
     for item in results:
         body.append(f"<div class='sample'><div class='sample-head'>排名 {item['rank']} · {item['symbol']} · "
                     f"{item['start_date']} 至 {item['end_date']} · 相似度 {item['score']:.4f} · "
