@@ -18,6 +18,11 @@ BEAR_RANGES = (
     (pd.Timestamp("2026-07-01"), None),
 )
 
+BULL_RANGES = (
+    (pd.Timestamp("2019-02-01"), pd.Timestamp("2021-11-29")),
+    (pd.Timestamp("2024-09-23"), pd.Timestamp("2026-06-30")),
+)
+
 
 def market_regime(date) -> str:
     """将单个日期分类为 ``熊市`` 或 ``牛市``。"""

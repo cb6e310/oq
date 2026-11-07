@@ -102,7 +102,7 @@ def wrap_subtitle(subtitle, max_width):
         lines.append(line)
     return lines
 
-def render_chart(bars,title,subtitle="",target_date=None,signal_date=None,period="D",width=720,height=360,show_volume=True,range_start=None,range_end=None,target_start=None,target_end=None,price_markers=None):
+def render_chart(bars,title,subtitle="",target_date=None,signal_date=None,period="D",width=720,height=360,show_volume=True,range_start=None,range_end=None,target_start=None,target_end=None,price_markers=None,axis_dates=None):
     """绘制单个周期 SVG；range_start/end 用于映射低周期完整视窗。"""
     bars=bars.reset_index(drop=True).copy()
     if bars.empty: return f'<svg viewBox="0 0 {width} 100" class="panel"><text x="12" y="50" class="title">{esc(title)}：无可用行情</text></svg>'
@@ -111,7 +111,17 @@ def render_chart(bars,title,subtitle="",target_date=None,signal_date=None,period
     has_markers=period=="D" and bool(price_markers)
     top=max(62,subtitle_last_y+(78 if has_markers else 20))
     height+=top-62
-    left,right,bottom=48,12,34; vol_h=54 if show_volume else 0; chart_h=height-top-bottom-vol_h-(8 if show_volume else 0); n=len(bars); xstep=(width-left-right)/max(n,1); xs=left+xstep*(np.arange(n)+.5)
+    left,right,bottom=48,12,34; vol_h=54 if show_volume else 0; chart_h=height-top-bottom-vol_h-(8 if show_volume else 0); n=len(bars)
+    if axis_dates is not None:
+        axis_dates=pd.DatetimeIndex(pd.to_datetime(axis_dates)).sort_values().unique()
+        axis_n=len(axis_dates)
+        axis_positions={date:i for i,date in enumerate(axis_dates)}
+        xstep=(width-left-right)/max(axis_n,1)
+        xs=np.asarray([left+xstep*(axis_positions.get(pd.Timestamp(date),0)+.5) for date in bars.date])
+    else:
+        axis_n=n; axis_dates=pd.DatetimeIndex(bars.date)
+        axis_positions={pd.Timestamp(date):i for i,date in enumerate(axis_dates)}
+        xstep=(width-left-right)/max(n,1); xs=left+xstep*(np.arange(n)+.5)
     # Price panels use a logarithmic coordinate system; volume remains linear.
     positive = bars[["low", "high"]].clip(lower=np.finfo(float).tiny)
     lo,hi=float(positive.low.min()),float(positive.high.max())
@@ -139,7 +149,7 @@ def render_chart(bars,title,subtitle="",target_date=None,signal_date=None,period
             if period=="D": bs,be=bd,bd
             elif period=="W": bs,be=bd-pd.Timedelta(days=6),bd
             else: bs,be=bd.to_period("M").start_time,bd.to_period("M").end_time.normalize()
-            if bs<=te and be>=ts: target_positions.append(i)
+            if bs<=te and be>=ts: target_positions.append(axis_positions.get(pd.Timestamp(bar_date), i))
     # Higher-timeframe panels shade the complete lower-timeframe viewport.
     # A weekly bar is represented by its Monday-Friday interval; a monthly bar
     # by its calendar-month interval. This makes the panels read like zoom levels.
@@ -199,8 +209,11 @@ def render_chart(bars,title,subtitle="",target_date=None,signal_date=None,period
         target_label = {"D": "D0一字", "W": "D0所在周", "M": "D0所在月"}[period]
         out.append(f'<text x="{xs[target_idx]:.1f}" y="{label_y}" class="mark targetmark" text-anchor="middle">{target_label}</text>')
     if signal_idx is not None and signal_idx!=target_idx: out.append(f'<text x="{xs[signal_idx]:.1f}" y="{label_y}" class="mark signalmark" text-anchor="middle">信号</text>')
-    step=max(1,n//6)
-    for i in range(0,n,step): out.append(f'<text x="{xs[i]:.1f}" y="{height-22}" class="axis" text-anchor="middle">{bars.iloc[i].date.strftime("%Y-%m" if period=="M" else "%m-%d")}</text>')
+    step=max(1,axis_n//6)
+    for i in range(0,axis_n,step):
+        label_date=pd.Timestamp(axis_dates[i])
+        label_x=left+xstep*(i+.5)
+        out.append(f'<text x="{label_x:.1f}" y="{height-22}" class="axis" text-anchor="middle">{label_date.strftime("%Y-%m" if period=="M" else "%m-%d")}</text>')
     return "".join(out)+"</svg>"
 
 def mobile_css():

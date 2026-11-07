@@ -34,7 +34,8 @@ open_quant/
     │   │   ├── results/         # 最终事件明细与统计
     │   │   ├── figures/         # 图表素材
     │   │   └── docs/            # 唯一完整回测与可视化报告
-    │   └── average_daily_amount_top50/ # 区间日均成交额排名
+    │   ├── average_daily_amount_top50/ # 区间日均成交额排名
+    │   └── bull_market_500pct/          # 牛市 500% 涨幅股票与行业分析
     ├── kline_similarity/        # K 线相似度搜索
     └── ten_year_return/         # 长期收益研究
         ├── strategy/            # 长期收益脚本
@@ -63,7 +64,8 @@ open_quant/
 │   │   │   ├── results/                  # 最终事件明细与统计 CSV
 │   │   │   ├── figures/                  # 收益分布、K 线长图等素材
 │   │   │   └── docs/                     # 唯一完整回测与可视化报告
-│   │   └── average_daily_amount_top50/  # 区间日均成交额排名
+│   │   ├── average_daily_amount_top50/  # 区间日均成交额排名
+│   │   └── bull_market_500pct/           # 牛市 500% 涨幅股票与行业分析
 │   ├── kline_similarity/                # K 线相似度搜索
 │   └── ten_year_return/                 # 长期收益研究
 │       ├── strategy/ten_year_return.py
@@ -260,6 +262,7 @@ daily = daily.merge(basic[["ts_code", "name", "industry"]], on="ts_code", how="l
 | `strategies/analysis/yizi_pullback/strategy/pattern.py` | 一字板回调形态识别与回测（当前正式策略口径） |
 | `strategies/analysis/yizi_pullback/strategy/market_regime_analysis.py` | 按固定牛熊区间分析买入后 T+25 正负收益相关性，并生成图表 |
 | `strategies/analysis/average_daily_amount_top50/strategy/average_daily_amount_top50.py` | 按 `amount` 字段统计区间日均成交额前 N 只股票 |
+| `strategies/analysis/bull_market_500pct/strategy/analyze.py` | 统计最近两次固定牛市中最大涨幅超过 500% 的股票及行业；详见该项目 README |
 
 事件研究的统一口径：
 - 一字板回调策略额外要求：D0 后复权收盘价不高于此前约 3 个月（63 根有效日线）最低后复权低点的 1.2 倍，即涨幅不超过 20%；历史窗口不含 D0。
