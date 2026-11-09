@@ -90,14 +90,18 @@ func evaluate(req request, engine *formula.FormulaEngine, program *formula.Progr
 		result.Error = err.Error()
 		return result
 	}
-	for _, item := range req.Bars {
-		market := formula.NewMarketData(item.Open, item.Close, item.High, item.Low, item.Volume, item.Amount)
-		current, appendErr := session.Append(market)
-		if appendErr != nil {
-			result.Error = appendErr.Error()
-			result.Signals = nil
-			return result
-		}
+	markets := make([]*formula.MarketData, len(req.Bars))
+	for i, item := range req.Bars {
+		markets[i] = formula.NewMarketData(item.Open, item.Close, item.High, item.Low, item.Volume, item.Amount)
+	}
+	currentResults, appendErr := session.AppendMany(markets)
+	if appendErr != nil {
+		result.Error = appendErr.Error()
+		result.Signals = nil
+		return result
+	}
+	for i, current := range currentResults {
+		item := req.Bars[i]
 		value, ok := selectedValue(current)
 		if ok && value != 0 && !math.IsNaN(value) && !math.IsInf(value, 0) {
 			result.Signals = append(result.Signals, signal{Date: item.Date, Value: value})

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"reflect"
 	"testing"
 
@@ -107,6 +108,44 @@ AND GAOWEI
 AND WEIPO;`
 	if _, err := formula.NewFormulaEngine().Compile(normalizeFormula(source)); err != nil {
 		t.Fatalf("user formula failed after normalizing logical continuations: %v", err)
+	}
+}
+
+func TestBatchEvaluationMatchesSingleBarReplayForUserFormula(t *testing.T) {
+	source := `A1:=REF(MA(C,5),29);
+A2:=REF(MA(C,5),21);
+A3:=REF(MA(C,5),13);
+A4:=REF(MA(C,5),5);
+S1:=A2/A1-1;
+S2:=A3/A2-1;
+S3:=A4/A3-1;
+JIASU:=S1>-0.005 AND S1<0.05 AND S2>S1+0.006 AND S2>0.008 AND S3>S2+0.006 AND S3<0.09;
+ZHANG:=A4/A1>1.05 AND A4/A1<1.30;
+PINGHUA:=REF(COUNT(MA(C,5)>REF(MA(C,5),1),24),5)>=16;
+XIAOYANG:=REF(COUNT(ABS(C/REF(C,1)-1)>0.06,25),5)<=2;
+BOXH:=HHV(H,5);
+BOXL:=LLV(L,5);
+TOP0:=REF(HHV(H,20),5);
+PINTAI:=BOXH/BOXL<1.07 AND ABS(C/REF(C,4)-1)<0.03;
+GAOWEI:=MA(C,5)>TOP0*0.95 AND MA(C,5)<TOP0*1.04;
+WEIPO:=C/REF(C,1)<1.045;
+XG:BARSCOUNT(C)>60 AND JIASU AND ZHANG AND PINGHUA AND XIAOYANG AND PINTAI AND GAOWEI AND WEIPO;`
+	engine := formula.NewFormulaEngine()
+	program, err := engine.Compile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := request{Formula: source, Symbol: "600000.SH", Bars: make([]bar, 120)}
+	for i := range req.Bars {
+		close := 10 + float64(i)*0.012 + float64(i%7)*0.002
+		req.Bars[i] = bar{Date: fmt.Sprintf("2024-%02d-%02d", 1+(i/28), 1+(i%28)),
+			Open: close * 0.998, High: close * 1.01, Low: close * 0.99,
+			Close: close, Volume: float64(1000 + i), Amount: float64(10000 + i)}
+	}
+	got := evaluate(req, engine, program)
+	want := evaluateFromSource(t, req)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("batch evaluation differs from per-bar replay: got %#v, want %#v", got, want)
 	}
 }
 
